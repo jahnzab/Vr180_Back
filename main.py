@@ -481,12 +481,62 @@ os.makedirs(PREVIEW_DIR, exist_ok=True)
 # -------------------------------
 
 
+# import torch
+# import os
+
+# # Set cache directory for runtime
+# os.environ['TORCH_HOME'] = '/opt/render/project/src/models'
+
+
+# # Global variables
+# midas = None
+# midas_transforms = None
+
+# def load_model_with_retry(max_retries=3):
+#     import time
+#     import random
+    
+#     for attempt in range(max_retries):
+#         try:
+#             model = torch.hub.load("intel-isl/MiDaS", "MiDaS_small", trust_repo=True, force_reload=False)
+#             transforms = torch.hub.load("intel-isl/MiDaS", "transforms", trust_repo=True, force_reload=False)
+#             return model, transforms.small_transform
+#         except Exception as e:
+#             if "rate limit" in str(e).lower() and attempt < max_retries - 1:
+#                 wait_time = (2 ** attempt) + random.uniform(0, 1)
+#                 print(f"Rate limit hit, waiting {wait_time:.2f} seconds...")
+#                 time.sleep(wait_time)
+#                 continue
+#             raise e
+#     raise Exception("Failed to load model after retries")
+
+# def get_midas_model():
+#     global midas, midas_transforms
+#     if midas is None:
+#         try:
+#             # Try loading from cache first
+#             midas = torch.hub.load("intel-isl/MiDaS", "MiDaS_small", trust_repo=True, force_reload=False)
+#             transforms = torch.hub.load("intel-isl/MiDaS", "transforms", trust_repo=True, force_reload=False)
+#             midas_transforms = transforms.small_transform
+#         except Exception as e:
+#             print(f"Cache load failed: {e}, trying with retry...")
+#             # Fallback with retry
+#             midas, midas_transforms = load_model_with_retry()
+        
+#         # Move to device and set to eval mode
+#         midas.to(device)
+#         midas.eval()
+    
+#     return midas, midas_transforms
 import torch
 import os
+import cv2
+import numpy as np
 
-# Set cache directory for runtime
+# Set cache directory for runtime (important for Render)
 os.environ['TORCH_HOME'] = '/opt/render/project/src/models'
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Global variables
 midas = None
@@ -495,11 +545,15 @@ midas_transforms = None
 def load_model_with_retry(max_retries=3):
     import time
     import random
-    
+
     for attempt in range(max_retries):
         try:
-            model = torch.hub.load("intel-isl/MiDaS", "MiDaS_small", trust_repo=True, force_reload=False)
-            transforms = torch.hub.load("intel-isl/MiDaS", "transforms", trust_repo=True, force_reload=False)
+            model = torch.hub.load(
+                "intel-isl/MiDaS", "MiDaS_small", trust_repo=True, force_reload=False
+            )
+            transforms = torch.hub.load(
+                "intel-isl/MiDaS", "transforms", trust_repo=True, force_reload=False
+            )
             return model, transforms.small_transform
         except Exception as e:
             if "rate limit" in str(e).lower() and attempt < max_retries - 1:
@@ -514,20 +568,67 @@ def get_midas_model():
     global midas, midas_transforms
     if midas is None:
         try:
-            # Try loading from cache first
-            midas = torch.hub.load("intel-isl/MiDaS", "MiDaS_small", trust_repo=True, force_reload=False)
-            transforms = torch.hub.load("intel-isl/MiDaS", "transforms", trust_repo=True, force_reload=False)
+            # Try loading from cache
+            midas = torch.hub.load(
+                "intel-isl/MiDaS", "MiDaS_small", trust_repo=True, force_reload=False
+            )
+            transforms = torch.hub.load(
+                "intel-isl/MiDaS", "transforms", trust_repo=True, force_reload=False
+            )
             midas_transforms = transforms.small_transform
         except Exception as e:
             print(f"Cache load failed: {e}, trying with retry...")
-            # Fallback with retry
             midas, midas_transforms = load_model_with_retry()
-        
-        # Move to device and set to eval mode
+
         midas.to(device)
         midas.eval()
-    
     return midas, midas_transforms
+
+def estimate_depth(img):
+    """
+    Run MiDaS depth estimation on a single frame.
+    """
+    model, transforms = get_midas_model()
+
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    input_tensor = transforms(img_rgb).to(device)
+    if input_tensor.dim() == 3:
+        input_tensor = input_tensor.unsqueeze(0)
+
+    with torch.no_grad():
+        prediction = model(input_tensor)
+
+    if prediction.dim() == 3:
+        prediction = prediction.unsqueeze(1)
+
+    prediction_resized = torch.nn.functional.interpolate(
+        prediction, size=img.shape[:2], mode="bicubic", align_corners=False
+    ).squeeze(0).squeeze(0)
+
+    depth = prediction_resized.cpu().numpy()
+    depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-6)
+    return depth
+
+def temporal_smooth(prev_depth, curr_depth, alpha=0.7):
+    if prev_depth is None:
+        return curr_depth
+    return alpha * prev_depth + (1 - alpha) * curr_depth
+
+def make_stereo_pair(img, depth, eye_offset=6):
+    """Create left/right stereo views from depth map."""
+    h, w = img.shape[:2]
+    depth_resized = cv2.resize(depth, (w, h))
+    left = np.zeros_like(img)
+    right = np.zeros_like(img)
+    for y in range(h):
+        for x in range(w):
+            shift = int((1 - depth_resized[y, x]) * eye_offset)
+            lx = min(w - 1, max(0, x - shift))
+            rx = min(w - 1, max(0, x + shift))
+            left[y, lx] = img[y, x]
+            right[y, rx] = img[y, x]
+    return left, right
+
 
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # midas = torch.hub.load("intel-isl/MiDaS", "MiDaS_small")  # lightweight
@@ -598,57 +699,57 @@ async def refresh_token(refresh_data: dict, db: Session = Depends(get_db)):
 # -------------------------------
 
 
-def estimate_depth(img):
-    """
-    Run MiDaS depth estimation on a single frame.
-    """
-    # Convert BGR to RGB if using OpenCV
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+# def estimate_depth(img):
+#     """
+#     Run MiDaS depth estimation on a single frame.
+#     """
+#     # Convert BGR to RGB if using OpenCV
+#     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-    # Transform -> [C, H, W]
-    input_tensor = midas_transforms(img_rgb).to(device)
+#     # Transform -> [C, H, W]
+#     input_tensor = midas_transforms(img_rgb).to(device)
 
-    # Add batch dimension -> [1, C, H, W]
-    if input_tensor.dim() == 3:
-        input_tensor = input_tensor.unsqueeze(0)
+#     # Add batch dimension -> [1, C, H, W]
+#     if input_tensor.dim() == 3:
+#         input_tensor = input_tensor.unsqueeze(0)
 
-    with torch.no_grad():
-        prediction = midas(input_tensor)  # output [1, H_out, W_out] or [1, 1, H_out, W_out]
+#     with torch.no_grad():
+#         prediction = midas(input_tensor)  # output [1, H_out, W_out] or [1, 1, H_out, W_out]
 
-    # Ensure 4D for interpolate
-    if prediction.dim() == 3:
-        prediction = prediction.unsqueeze(1)  # [1, 1, H, W]
+#     # Ensure 4D for interpolate
+#     if prediction.dim() == 3:
+#         prediction = prediction.unsqueeze(1)  # [1, 1, H, W]
 
-    # Resize to original frame size
-    prediction_resized = torch.nn.functional.interpolate(
-        prediction, size=img.shape[:2], mode="bicubic", align_corners=False
-    ).squeeze(0).squeeze(0)  # remove batch & channel dims
+#     # Resize to original frame size
+#     prediction_resized = torch.nn.functional.interpolate(
+#         prediction, size=img.shape[:2], mode="bicubic", align_corners=False
+#     ).squeeze(0).squeeze(0)  # remove batch & channel dims
 
-    # Normalize depth
-    depth = prediction_resized.cpu().numpy()
-    depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-6)
-    return depth
+#     # Normalize depth
+#     depth = prediction_resized.cpu().numpy()
+#     depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-6)
+#     return depth
 
 
-def temporal_smooth(prev_depth, curr_depth, alpha=0.7):
-    if prev_depth is None:
-        return curr_depth
-    return alpha * prev_depth + (1 - alpha) * curr_depth
+# def temporal_smooth(prev_depth, curr_depth, alpha=0.7):
+#     if prev_depth is None:
+#         return curr_depth
+#     return alpha * prev_depth + (1 - alpha) * curr_depth
 
-def make_stereo_pair(img, depth, eye_offset=6):
-    """Create left/right stereo views from depth map."""
-    h, w = img.shape[:2]
-    depth_resized = cv2.resize(depth, (w, h))  # match depth to frame
-    left = np.zeros_like(img)
-    right = np.zeros_like(img)
-    for y in range(h):
-        for x in range(w):
-            shift = int((1 - depth_resized[y, x]) * eye_offset)
-            lx = min(w - 1, max(0, x - shift))
-            rx = min(w - 1, max(0, x + shift))
-            left[y, lx] = img[y, x]
-            right[y, rx] = img[y, x]
-    return left, right
+# def make_stereo_pair(img, depth, eye_offset=6):
+#     """Create left/right stereo views from depth map."""
+#     h, w = img.shape[:2]
+#     depth_resized = cv2.resize(depth, (w, h))  # match depth to frame
+#     left = np.zeros_like(img)
+#     right = np.zeros_like(img)
+#     for y in range(h):
+#         for x in range(w):
+#             shift = int((1 - depth_resized[y, x]) * eye_offset)
+#             lx = min(w - 1, max(0, x - shift))
+#             rx = min(w - 1, max(0, x + shift))
+#             left[y, lx] = img[y, x]
+#             right[y, rx] = img[y, x]
+#     return left, right
 
 
 # method for injector vr 180
