@@ -1,3 +1,8 @@
+setuptools==68.2.2
+wheel==0.41.2
+pip==23.3.1
+
+# Your existing dependencies below...
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 sqlalchemy==2.0.23
@@ -10,9 +15,9 @@ pydantic==2.5.0
 git+https://github.com/google/spatial-media.git
 requests
 opencv-python
-torch==2.8.0+cpu 
-torchvision==0.23.0+cpu 
-torchaudio==2.8.0+cpu
+torch
+torchvision
+torchaudio
 numpy==1.24.4
 scipy==1.11.1
 tqdm
