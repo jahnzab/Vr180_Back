@@ -479,20 +479,25 @@ os.makedirs(PREVIEW_DIR, exist_ok=True)
 # -------------------------------
 # Convert Endpoint
 # -------------------------------
-from midas.model import MidasNet_small
-from midas.transforms import small_transform
+
 import torch
 import os
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# Load the model directly from the .pt file
-midas = torch.load("midas_v21_small_256.pt", map_location=device)  # adjust path if needed
+midas = torch.load("midas_v21_small_256.pt", map_location=device)
 midas.to(device)
 midas.eval()
 
+def midas_preprocess(img):
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img_resized = cv2.resize(img_rgb, (256, 256))
+    img_resized = img_resized / 255.0
+    tensor = torch.from_numpy(img_resized).permute(2, 0, 1).unsqueeze(0).float()
+    return tensor.to(device)
+
+
 # If you need transforms, you have to define them manually or copy from MiDaS repo
-midas_transforms = None  # replace with actual preprocessing if required
+  # replace with actual preprocessing if required
 
 print(midas)
 print(midas_transforms)
@@ -565,35 +570,51 @@ async def refresh_token(refresh_data: dict, db: Session = Depends(get_db)):
 # Depth estimation + smoothing
 # -------------------------------
 def estimate_depth(img):
-    """
-    Run MiDaS depth estimation on a single frame.
-    """
-    # Convert BGR to RGB if using OpenCV
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-    # Transform -> [C, H, W]
-    input_tensor = midas_transforms(img_rgb).to(device)
-
-    # Add batch dimension -> [1, C, H, W]
-    if input_tensor.dim() == 3:
-        input_tensor = input_tensor.unsqueeze(0)
-
+    input_tensor = midas_preprocess(img)
     with torch.no_grad():
-        prediction = midas(input_tensor)  # output [1, H_out, W_out] or [1, 1, H_out, W_out]
+        prediction = midas(input_tensor)
 
-    # Ensure 4D for interpolate
     if prediction.dim() == 3:
-        prediction = prediction.unsqueeze(1)  # [1, 1, H, W]
+        prediction = prediction.unsqueeze(1)
 
-    # Resize to original frame size
     prediction_resized = torch.nn.functional.interpolate(
         prediction, size=img.shape[:2], mode="bicubic", align_corners=False
-    ).squeeze(0).squeeze(0)  # remove batch & channel dims
+    ).squeeze(0).squeeze(0)
 
-    # Normalize depth
     depth = prediction_resized.cpu().numpy()
     depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-6)
     return depth
+
+# def estimate_depth(img):
+#     """
+#     Run MiDaS depth estimation on a single frame.
+#     """
+#     # Convert BGR to RGB if using OpenCV
+#     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+#     # Transform -> [C, H, W]
+#     input_tensor = midas_transforms(img_rgb).to(device)
+
+#     # Add batch dimension -> [1, C, H, W]
+#     if input_tensor.dim() == 3:
+#         input_tensor = input_tensor.unsqueeze(0)
+
+#     with torch.no_grad():
+#         prediction = midas(input_tensor)  # output [1, H_out, W_out] or [1, 1, H_out, W_out]
+
+#     # Ensure 4D for interpolate
+#     if prediction.dim() == 3:
+#         prediction = prediction.unsqueeze(1)  # [1, 1, H, W]
+
+#     # Resize to original frame size
+#     prediction_resized = torch.nn.functional.interpolate(
+#         prediction, size=img.shape[:2], mode="bicubic", align_corners=False
+#     ).squeeze(0).squeeze(0)  # remove batch & channel dims
+
+#     # Normalize depth
+#     depth = prediction_resized.cpu().numpy()
+#     depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-6)
+#     return depth
 
 
 def temporal_smooth(prev_depth, curr_depth, alpha=0.7):
