@@ -480,8 +480,12 @@ os.makedirs(PREVIEW_DIR, exist_ok=True)
 # Convert Endpoint
 # -------------------------------
 
+
 import torch
 import os
+
+# Set cache directory for runtime
+os.environ['TORCH_HOME'] = '/opt/render/project/src/models'
 
 
 # Global variables
