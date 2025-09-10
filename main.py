@@ -484,13 +484,52 @@ import torch
 import os
 
 
+# Global variables
+midas = None
+midas_transforms = None
 
+def load_model_with_retry(max_retries=3):
+    import time
+    import random
+    
+    for attempt in range(max_retries):
+        try:
+            model = torch.hub.load("intel-isl/MiDaS", "MiDaS_small", trust_repo=True, force_reload=False)
+            transforms = torch.hub.load("intel-isl/MiDaS", "transforms", trust_repo=True, force_reload=False)
+            return model, transforms.small_transform
+        except Exception as e:
+            if "rate limit" in str(e).lower() and attempt < max_retries - 1:
+                wait_time = (2 ** attempt) + random.uniform(0, 1)
+                print(f"Rate limit hit, waiting {wait_time:.2f} seconds...")
+                time.sleep(wait_time)
+                continue
+            raise e
+    raise Exception("Failed to load model after retries")
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-midas = torch.hub.load("intel-isl/MiDaS", "MiDaS_small")  # lightweight
-midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms").small_transform
-midas.to(device)
-midas.eval()
+def get_midas_model():
+    global midas, midas_transforms
+    if midas is None:
+        try:
+            # Try loading from cache first
+            midas = torch.hub.load("intel-isl/MiDaS", "MiDaS_small", trust_repo=True, force_reload=False)
+            transforms = torch.hub.load("intel-isl/MiDaS", "transforms", trust_repo=True, force_reload=False)
+            midas_transforms = transforms.small_transform
+        except Exception as e:
+            print(f"Cache load failed: {e}, trying with retry...")
+            # Fallback with retry
+            midas, midas_transforms = load_model_with_retry()
+        
+        # Move to device and set to eval mode
+        midas.to(device)
+        midas.eval()
+    
+    return midas, midas_transforms
+
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# midas = torch.hub.load("intel-isl/MiDaS", "MiDaS_small")  # lightweight
+# midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms").small_transform
+# midas.to(device)
+# midas.eval()
 @app.get("/working")
 async def working():
     return {"message": "✅ System working - processing in background"}
