@@ -486,12 +486,14 @@ import os
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-midas = MidasNet_small()
-midas.load_state_dict(torch.load("midas_v21_small_256.pt", map_location=device))
+# Load the model directly from the .pt file
+midas = torch.load("midas_v21_small_256.pt", map_location=device)  # adjust path if needed
 midas.to(device)
 midas.eval()
 
-midas_transforms = small_transform
+# If you need transforms, you have to define them manually or copy from MiDaS repo
+midas_transforms = None  # replace with actual preprocessing if required
+
 print(midas)
 print(midas_transforms)
 
