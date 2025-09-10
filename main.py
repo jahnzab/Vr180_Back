@@ -479,11 +479,27 @@ os.makedirs(PREVIEW_DIR, exist_ok=True)
 # -------------------------------
 # Convert Endpoint
 # -------------------------------
+from midas.model import MidasNet_small
+from midas.transforms import small_transform
+import torch
+import os
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-midas = torch.hub.load("intel-isl/MiDaS", "MiDaS_small")  # lightweight
-midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms").small_transform
+
+midas = MidasNet_small()
+midas.load_state_dict(torch.load("midas_v21_small_256.pt", map_location=device))
 midas.to(device)
 midas.eval()
+
+midas_transforms = small_transform
+print(midas)
+print(midas_transforms)
+
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# midas = torch.hub.load("intel-isl/MiDaS", "MiDaS_small")  # lightweight
+# midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms").small_transform
+# midas.to(device)
+# midas.eval()
 # @app.get("/working")
 # async def working():
 #     return {"message": "✅ System working - processing in background"}
@@ -1281,7 +1297,8 @@ def get_all_feedback(db: Session = Depends(get_db)):
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.utcnow()}
+import uvicorn
+port = int(os.environ.get("PORT", 8000))
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
