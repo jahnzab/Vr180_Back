@@ -500,7 +500,7 @@ def midas_preprocess(img):
   # replace with actual preprocessing if required
 
 print(midas)
-print(midas_transforms)
+
 
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # midas = torch.hub.load("intel-isl/MiDaS", "MiDaS_small")  # lightweight
