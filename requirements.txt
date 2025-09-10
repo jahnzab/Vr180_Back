@@ -24,3 +24,4 @@ tqdm
 timm
 uuid
 moviepy==1.0.3
+PyJWT
