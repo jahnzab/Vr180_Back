@@ -25,7 +25,17 @@ from urllib.parse import unquote
 import os
 from sqlalchemy.orm import Session
 # Initialize FastAPI app
-
+# Add these imports at the TOP of gpu1.py
+from typing import Tuple, List, Dict, Optional, Any
+import cv2
+import numpy as np
+import torch
+import subprocess
+import os
+import tempfile
+import shutil
+from PIL import Image
+import json
 import os
 import tempfile
 import asyncio
