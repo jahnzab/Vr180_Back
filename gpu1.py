@@ -1638,7 +1638,7 @@ async def convert_video(
         
     finally:
     # Cleanup temporary files - KEEP FINAL OUTPUT
-         def cleanup():
+        def cleanup():
            try:
             # Only clean up INTERMEDIATE files, keep the final output
               cleanup_paths = [input_path, output_path, fisheye_path]  # Intermediate files
