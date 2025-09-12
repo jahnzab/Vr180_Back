@@ -527,15 +527,15 @@ async def refresh_token(refresh_data: dict, db: Session = Depends(get_db)):
 # -------------------------------
 # GPU-Optimized Depth estimation
 # -------------------------------
-def inject_vr180_metadata(
+def inject_vr180_metadata_8k(
     input_video_path: str,
     output_video_path: str,
-    center_scale_width: int = 7680,    # 8K width (4x upscaled from 1920)
-    center_scale_height: int = 4320,   # 8K height (4x upscaled from 1080)
-    cropped_image_width: int = 7680,   # Final output width
-    cropped_image_height: int = 4320,  # Final output height (full resolution)
+    center_scale_width: int = 8192,    # Full 8K width
+    center_scale_height: int = 4096,   # VR180 standard height
+    cropped_image_width: int = 8192,
+    cropped_image_height: int = 4096,
     cropped_left: int = 0,
-    cropped_top: int = 0                # 0 for side-by-side (no vertical crop)
+    cropped_top: int = 0
 ):
 
     """
@@ -1426,78 +1426,105 @@ def convert_2d_to_vr180_gpu_optimized(
 
         print(f"✅ Processed {len(frame_paths)} frames, creating video...")
         
-        # Create output video - FIXED INDENTATION AND SYNTAX
+        # === FIXED VIDEO CREATION SECTION ===
         try:
             if upscale_to_8k:
-                # Higher quality settings for 8K
+                # For 8K, use software encoder (x264) as NVENC doesn't support >4096 width
+                print("🎬 Using software encoder for 8K (NVENC limitation)")
                 cmd = [
                     "ffmpeg", "-y",
                     "-r", str(fps),
                     "-i", os.path.join(temp_dir, "%05d.png"),
-                    "-c:v", "libx264",
-                    "-preset", "slow",
-                    "-crf", "18",
+                    "-c:v", "libx264",           # Software encoder
+                    "-preset", "medium",         # Balanced speed/quality
+                    "-crf", "18",               # High quality
                     "-pix_fmt", "yuv420p",
-                    "-threads", "0",
+                    "-movflags", "+faststart",   # Web optimization
+                    "-threads", "0",            # Use all CPU cores
                     output_path
                 ]
+                
+                # Try with lower quality if encoding fails
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+                
+                if result.returncode != 0:
+                    print("⚠️ High quality encoding failed, trying faster preset")
+                    cmd[cmd.index("-preset") + 1] = "fast"
+                    cmd[cmd.index("-crf") + 1] = "23"  # Lower quality
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+                    
             else:
-                # Standard settings for 4K
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-r", str(fps),
-                    "-i", os.path.join(temp_dir, "%05d.png"),
-                    "-c:v", "libx264",
-                    "-preset", "medium",
-                    "-crf", "23",
-                    "-pix_fmt", "yuv420p",
-                    "-threads", "0",
-                    output_path
-                ]
-
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
-            
-            if result.returncode != 0:
-                print("⚠️ GPU encoding failed, falling back to CPU")
-               
+                # For 4K and below, try NVENC first, fallback to x264
+                print("🎬 Trying hardware encoder (NVENC)")
                 cmd = [
                     "ffmpeg", "-y",
                     "-r", str(fps),
                     "-i", os.path.join(temp_dir, "%05d.png"),
                     "-c:v", "h264_nvenc",
-                    "-b:v", "50M" if upscale_to_8k else "35M",
-                    "-maxrate", "40M" if upscale_to_8k else "25M",
-                    "-bufsize", "80M" if upscale_to_8k else "50M",
+                    "-preset", "p4",             # NVENC preset
+                    "-cq", "23",                # Constant quality
+                    "-b:v", "25M",              # Target bitrate
+                    "-maxrate", "35M",
+                    "-bufsize", "50M",
                     "-pix_fmt", "yuv420p",
+                    "-movflags", "+faststart",
                     "-threads", "0",
                     output_path
                 ]
-
+                
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
+                
+                if result.returncode != 0:
+                    print("⚠️ NVENC failed, falling back to software encoder")
+                    cmd = [
+                        "ffmpeg", "-y",
+                        "-r", str(fps),
+                        "-i", os.path.join(temp_dir, "%05d.png"),
+                        "-c:v", "libx264",
+                        "-preset", "medium",
+                        "-crf", "23",
+                        "-pix_fmt", "yuv420p",
+                        "-movflags", "+faststart",
+                        "-threads", "0",
+                        output_path
+                    ]
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
             
             if result.returncode != 0:
-                raise RuntimeError(f"Video encoding failed: {result.stderr}")
+                # Final fallback with very safe settings
+                print("⚠️ Standard encoding failed, trying safe fallback")
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-r", str(fps),
+                    "-i", os.path.join(temp_dir, "%05d.png"),
+                    "-c:v", "libx264",
+                    "-preset", "ultrafast",      # Fastest encoding
+                    "-crf", "28",               # Lower quality but reliable
+                    "-pix_fmt", "yuv420p",
+                    "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",  # Ensure even dimensions
+                    output_path
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
+                
+            if result.returncode != 0:
+                raise RuntimeError(f"All encoding attempts failed. Last error: {result.stderr}")
                 
         except subprocess.TimeoutExpired:
-            raise RuntimeError("Video encoding timeout - video too long for Colab")
+            raise RuntimeError("Video encoding timeout - try reducing quality or video length")
 
         if not os.path.exists(output_path):
-            raise RuntimeError("Failed to create output video.")
+            raise RuntimeError("Failed to create output video file")
 
-        print("✅ VR180 conversion completed")
+        print("✅ VR180 conversion completed successfully")
         if upscale_to_8k:
             print("🎯 8K upscaling successfully applied")
-
-    except Exception as e:
-        print(f"❌ Conversion failed: {e}")
-        raise e
+            print("ℹ️  Note: 8K encoding uses software encoder (CPU) due to hardware limitations")
+            
     finally:
         if 'cap' in locals():
             cap.release()
         shutil.rmtree(temp_dir, ignore_errors=True)
         clear_gpu_cache()
-        # Your existing video creation code...
-        
     # Create output video - adjust settings for 8K
    
 # Base directories
