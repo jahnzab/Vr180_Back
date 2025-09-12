@@ -1,0 +1,74 @@
+setuptools==68.2.2
+wheel==0.41.2
+pip==23.3.1
+
+# Your existing dependencies below...
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+sqlalchemy==2.0.23
+psycopg2-binary==2.9.9
+passlib[bcrypt]==1.7.4
+python-jose[cryptography]==3.3.0
+python-multipart==0.0.6
+httpx==0.25.2
+pydantic==2.5.0
+git+https://github.com/google/spatial-media.git
+requests
+opencv-python
+torch
+torchvision
+torchaudio
+numpy
+scipy
+tqdm
+timm
+uuid
+moviepy==1.0.3
+PyJWT
+# FastAPI & Web Server
+
+python-multipart
+python-jose
+passlib==1.7.4
+bcrypt==4.0.1
+
+# Computer Vision & Processing
+opencv-python
+numpy
+Pillow
+scikit-image
+imageio
+
+# AI & Machine Learning
+torch
+torchvision
+transformers
+diffusers
+accelerate
+xformers
+# Depth Estimation
+depth-anything-v2
+timm
+
+# Video & Audio Processing
+ffmpeg-python
+imageio-ffmpeg
+pydub
+
+# Utilities & System
+aiofiles
+python-magic
+python-dateutil
+tqdm
+psutil
+GPUtil
+
+# Database (if using)
+sqlalchemy
+alembic
+psycopg2-binary
+
+# Optional: AI Upscaling (Uncomment if needed)
+# git+https://github.com/xinntao/Real-ESRGAN.git
+# basicsr==1.4.2
+# realesrgan==0.3.0
