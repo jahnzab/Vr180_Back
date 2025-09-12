@@ -1,9 +1,4 @@
 # GPU-optimized VR180 converter for Google Colab T4
-import os
-os.environ['XDG_RUNTIME_DIR'] = '/tmp/runtime-kaggle'
-os.environ['PYTHONWARNINGS'] = 'ignore'  # Suppress warnings
-# Optionally disable ALSA audio warnings if not needed
-os.environ['ALSA_CONFIG_PATH'] = '/dev/null'
 import torch
 import cv2
 import numpy as np
@@ -1063,7 +1058,7 @@ def smart_upscale_to_8k(image, method="lanczos"):
         raise ValueError(f"Invalid image dimensions: {w}x{h}")
     
     # FIXED: 4x upscaling for 1K to 8K (instead of 2x)
-    target_w, target_h = w * 4, h * 4
+    target_w, target_h = w * 8, h * 8
     
     if target_w <= 0 or target_h <= 0:
         raise ValueError(f"Invalid target dimensions: {target_w}x{target_h}")
@@ -1506,7 +1501,7 @@ def convert_2d_to_vr180_gpu_optimized(
     # Create output video - adjust settings for 8K
    
 # Base directories
-BASE_DIR = "/kaggle/working/Vr180_Back"  # Colab base directory
+BASE_DIR = "/content/Vr180_Back"  # Colab base directory
 UPLOAD_DIR = os.path.join(BASE_DIR, "tmp_uploads")
 FINAL_DIR = os.path.join(BASE_DIR, "videos")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -1713,18 +1708,19 @@ async def convert_video(
     finally:
         # Cleanup temporary files
         def cleanup():
-            try:
-                cleanup_paths = [input_path, output_path]
-                if 'temp_with_audio' in locals() and temp_with_audio:
-                    cleanup_paths.append(temp_with_audio)
-                    
-                for path in cleanup_paths:
-                    if os.path.exists(path):
-                        os.unlink(path)
-                        print(f"🧹 Cleaned up: {path}")
-                clear_gpu_cache()
-            except Exception as e:
-                print(f"Cleanup error: {e}")
+           try:
+              cleanup_paths = [input_path]   # only remove input file
+              if 'temp_with_audio' in locals() and temp_with_audio:
+                 cleanup_paths.append(temp_with_audio)  # remove temp audio if exists
+
+              for path in cleanup_paths:
+                if os.path.exists(path):
+                  os.unlink(path)
+                  print(f"🧹 Cleaned up: {path}")
+
+              clear_gpu_cache()  # <-- keep this inside try
+           except Exception as e:
+               print(f"Cleanup error: {e}")
 
         threading.Thread(target=cleanup, daemon=True).start()
 # Enhanced user conversions endpoint with better debugging
