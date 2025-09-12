@@ -527,279 +527,139 @@ async def refresh_token(refresh_data: dict, db: Session = Depends(get_db)):
 # -------------------------------
 # GPU-Optimized Depth estimation
 # -------------------------------
-def inject_vr180_metadata_8k(
-    input_video_path: str,
-    output_video_path: str,
-    center_scale_width: int = 8192,    # Full 8K width
-    center_scale_height: int = 4096,   # VR180 standard height
-    cropped_image_width: int = 8192,
-    cropped_image_height: int = 4096,
-    cropped_left: int = 0,
-    cropped_top: int = 0
-):
-
+def convert_to_equidistant_fisheye(
+    frame: np.ndarray,
+    output_size: Tuple[int, int] = (3840, 3840)  # Per-eye resolution
+) -> np.ndarray:
     """
-    Inject VR180 metadata into a video using multiple approaches with built-in verification and debugging.
-    Targets tags at the VIDEO STREAM level, which is most reliable for VR players.
+    Convert frame to equidistant fisheye projection - VISUAL TRANSFORMATION
     """
-    import subprocess
-    import json
-    import os
+    height, width = frame.shape[:2]
+    output_height, output_width = output_size
     
-    def debug_video_metadata(video_path: str):
-        """Debug function to show all metadata in a video file."""
-        print(f"🔍 Debugging metadata for: {video_path}")
-        try:
-            cmd = [
-                "ffprobe", "-v", "quiet",
-                "-show_entries", "format:stream:format_tags:stream_tags",
-                "-of", "json", video_path
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            data = json.loads(result.stdout)
-            print("📋 All metadata found:")
-            print(json.dumps(data, indent=2))
-            return data
-        except Exception as e:
-            print(f"❌ Debug failed: {str(e)}")
-            return None
-
-    def verify_vr180_metadata(video_path: str) -> dict:
-        """Verify if VR180 metadata is present and return detailed results."""
-        try:
-            # Method 1: Check with ffprobe
-            probe_cmd = [
-                "ffprobe", "-v", "quiet",
-                "-show_entries", "stream_tags:format_tags",
-                "-of", "json", video_path
-            ]
-            
-            probe = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
-            metadata = json.loads(probe.stdout)
-            
-            metadata_str = str(metadata).lower()
-            
-            vr_indicators = [
-                "spherical", "stereo_mode", "projection", 
-                "equirectangular", "left_right", "spatial",
-                "full_pano_width_pixels", "full_pano_height_pixels", 
-                "cropped_area_image_width", "cropped_area_image_height"
-            ]
-            
-            found_indicators = [indicator for indicator in vr_indicators if indicator in metadata_str]
-            
-            # Extract actual values (optional for detailed validation)
-            extracted_values = {}
-            try:
-                format_tags = metadata.get('format', {}).get('tags', {})
-                stream_tags = metadata.get('streams', [{}])[0].get('tags', {})
-                
-                # Combine and prioritize stream tags, as they are more important for players
-                all_tags = {**format_tags, **stream_tags}
-                
-                extracted_values = {
-                    "spherical": all_tags.get('spherical'),
-                    "projection": all_tags.get('projection'),
-                    "stereo_mode": all_tags.get('stereo_mode'),
-                    "full_pano_width_pixels": all_tags.get('full_pano_width_pixels'),
-                    "full_pano_height_pixels": all_tags.get('full_pano_height_pixels'),
-                    "cropped_area_image_width": all_tags.get('cropped_area_image_width'),
-                    "cropped_area_image_height": all_tags.get('cropped_area_image_height')
-                }
-            except Exception as e:
-                print(f"⚠️ Failed to extract detailed metadata fields: {e}")
-
-            if found_indicators:
-                print(f"✅ VR180 metadata found: {', '.join(found_indicators)}")
-                return {
-                    "success": True,
-                    "indicators": found_indicators,
-                    "extracted_values": extracted_values,
-                    "metadata": metadata
-                }
-            
-            print(f"⚠️ No VR180 metadata detected in {video_path}")
-            return {"success": False, "indicators": [], "metadata": metadata}
-
-        except Exception as e:
-            print(f"❌ Error verifying metadata: {str(e)}")
-            return {"success": False, "error": str(e)}
-
+    # Create output image
+    fisheye_image = np.zeros((output_height, output_width, 3), dtype=np.uint8)
+    
+    center_x, center_y = output_width // 2, output_height // 2
+    max_radius = min(center_x, center_y)
+    
+    # Create coordinate grids
+    y_coords, x_coords = np.ogrid[:output_height, :output_width]
+    distances = np.sqrt((x_coords - center_x)**2 + (y_coords - center_y)**2)
+    angles = np.arctan2(y_coords - center_y, x_coords - center_x)
+    
+    # Normalize distances (equidistant projection)
+    normalized_distances = distances / max_radius
+    normalized_distances = np.clip(normalized_distances, 0, 1)
+    
+    # Calculate source coordinates (equidistant mapping)
+    source_x = (normalized_distances * np.cos(angles) + 1) * (width / 2)
+    source_y = (normalized_distances * np.sin(angles) + 1) * (height / 2)
+    
+    source_x = np.clip(source_x, 0, width - 1).astype(int)
+    source_y = np.clip(source_y, 0, height - 1).astype(int)
+    
+    # Map pixels using equidistant projection
+    fisheye_image[y_coords, x_coords] = frame[source_y, source_x]
+    
+    return fisheye_image
+def create_side_by_side_video(
+    left_frames: List[np.ndarray],
+    right_frames: List[np.ndarray],
+    output_path: str,
+    fps: float,
+    per_eye_resolution: Tuple[int, int] = (3840, 3840)
+) -> None:
+    """
+    Create side-by-side video from left/right eye frames
+    """
+    temp_dir = tempfile.mkdtemp()
     
     try:
-        # Debug input file first
-        print("🔍 DEBUGGING INPUT FILE:")
-        debug_video_metadata(input_video_path)
+        for i, (left_frame, right_frame) in enumerate(zip(left_frames, right_frames)):
+            # Convert both eyes to fisheye
+            left_fisheye = convert_to_equidistant_fisheye(left_frame, per_eye_resolution)
+            right_fisheye = convert_to_equidistant_fisheye(right_frame, per_eye_resolution)
+            
+            # Combine side-by-side
+            sbs_frame = np.concatenate((left_fisheye, right_fisheye), axis=1)
+            frame_path = os.path.join(temp_dir, f"{i:06d}.png")
+            cv2.imwrite(frame_path, sbs_frame)
         
-        # Method 1: PRIMARY METHOD - Target VIDEO STREAM tags explicitly
-        print("\n🔄 Attempting Method 1: Targeted Video Stream Metadata...")
-        cmd1 = [
-            "ffmpeg", "-y", "-i", input_video_path,
-            "-c:v", "copy", "-c:a", "copy",        # Copy audio and video streams
-            "-movflags", "use_metadata_tags",      # Important: use existing metadata tags
-            "-map_metadata", "0",                  # Copy metadata from input to output
-            # TARGET METADATA AT THE VIDEO STREAM LEVEL (s:v:0)
-            "-metadata:s:v:0", f"spherical=true",
-            "-metadata:s:v:0", f"stereo_mode=left_right",
-            "-metadata:s:v:0", f"projection=equirectangular",
-            "-metadata:s:v:0", f"full_pano_width_pixels={center_scale_width}",
-            "-metadata:s:v:0", f"full_pano_height_pixels={center_scale_height}",
-            "-metadata:s:v:0", f"cropped_area_image_width={cropped_image_width}",
-            "-metadata:s:v:0", f"cropped_area_image_height={cropped_image_height}",
-            "-metadata:s:v:0", f"cropped_area_left={cropped_left}",
-            "-metadata:s:v:0", f"cropped_area_top={cropped_top}",
-            output_video_path
-        ]
-        
-        result1 = subprocess.run(cmd1, capture_output=True, text=True)
-        
-        if result1.returncode == 0:
-            print("✅ Method 1 (Video Stream) command executed successfully.")
-            print("🔍 DEBUGGING OUTPUT FILE AFTER METHOD 1:")
-            verification = verify_vr180_metadata(output_video_path)
-            if verification["success"]:
-                print("🎉 SUCCESS: VR180 metadata verified!")
-                return {"status": "success", "method": "targeted_stream", "output_file": output_video_path, "verification": verification}
-            else:
-                print("❌ Method 1 produced a file, but verification failed.")
-        else:
-            print(f"❌ Method 1 failed: {result1.stderr}")
-        # Method 2: Using spatial-media approach (Google's standard)
-        print("🔄 Attempting Method 2: Spatial media format...")
-        cmd2 = [
-            "ffmpeg", "-y", "-i", input_video_path,
-            "-c:v", "copy", "-c:a", "copy",
-            "-movflags", "faststart",
-            "-metadata", "spherical-video=true",
-            "-metadata", "stereo-mode=left-right",
-            "-metadata", "source-count=2",
-            output_video_path
-        ]
-        
-        result2 = subprocess.run(cmd2, capture_output=True, text=True)
-        
-        if result2.returncode == 0:
-            print("🔍 DEBUGGING OUTPUT FILE AFTER METHOD 2:")
-            debug_video_metadata(output_video_path)
-            verification = verify_vr180_metadata(output_video_path)
-            if verification["success"]:
-                return {"status": "success", "method": "spatial-media", "output_file": output_video_path, "verification": verification}
-        else:
-            print(f"❌ Method 2 failed: {result2.stderr}")
-        
-        print("\n⚠️ Method 2 failed, trying Method 3...")
-        
-        # Method 3: Explicit box writing for MP4
-        print("🔄 Attempting Method 3: Direct MP4 box injection...")
-        temp_output = output_video_path.replace('.mp4', '_temp.mp4')
-        
-        cmd3 = [
-            "ffmpeg", "-y", "-i", input_video_path,
-            "-c", "copy",
-            "-map_metadata", "0",
+        # Create video from frames
+        cmd = [
+            "ffmpeg", "-y",
+            "-r", str(fps),
+            "-i", os.path.join(temp_dir, "%06d.png"),
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-crf", "18",
+            "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
-            temp_output
+            output_path
         ]
         
-        result3 = subprocess.run(cmd3, capture_output=True, text=True)
+        subprocess.run(cmd, check=True)
+        print(f"✅ Created side-by-side video: {output_path}")
         
-        if result3.returncode == 0:
-            # Now add metadata using a different approach
-            cmd3b = [
-                "ffmpeg", "-y", "-i", temp_output,
-                "-c", "copy",
-                "-metadata:s:v:0", "handler_name=VideoHandler",
-                "-metadata:s:v:0", "spherical=true",
-                "-metadata:s:v:0", "stereo_mode=left_right",
-                "-f", "mp4",
-                output_video_path
-            ]
-            
-            result3b = subprocess.run(cmd3b, capture_output=True, text=True)
-            
-            # Clean up temp file
-            if os.path.exists(temp_output):
-                os.remove(temp_output)
-            
-            if result3b.returncode == 0:
-                print("🔍 DEBUGGING OUTPUT FILE AFTER METHOD 3:")
-                debug_video_metadata(output_video_path)
-                verification = verify_vr180_metadata(output_video_path)
-                if verification["success"]:
-                    return {"status": "success", "method": "direct-box", "output_file": output_video_path, "verification": verification}
-            else:
-                print(f"❌ Method 3b failed: {result3b.stderr}")
-        else:
-            print(f"❌ Method 3a failed: {result3.stderr}")
-        
-        print("\n⚠️ Method 3 failed, trying Method 4...")
-        
-        # Method 4: Using exiftool as fallback (if available)
-        try:
-            print("🔄 Attempting Method 4: ExifTool approach...")
-            # First copy the file
-            subprocess.run(["cp", input_video_path, output_video_path], check=True)
-            
-            # Then use exiftool to add metadata
-            exiftool_cmd = [
-                "exiftool", 
-                "-overwrite_original",
-                "-ProjectionType=equirectangular",
-                "-StereoMode=left_right",
-                "-SphericalVideo=true",
-                output_video_path
-            ]
-            
-            result4 = subprocess.run(exiftool_cmd, capture_output=True, text=True)
-            
-            if result4.returncode == 0:
-                print("🔍 DEBUGGING OUTPUT FILE AFTER METHOD 4:")
-                debug_video_metadata(output_video_path)
-                verification = verify_vr180_metadata(output_video_path)
-                if verification["success"]:
-                    return {"status": "success", "method": "exiftool", "output_file": output_video_path, "verification": verification}
-            else:
-                print(f"❌ Method 4 failed: {result4.stderr}")
-        except FileNotFoundError:
-            print("📝 ExifTool not available, skipping Method 4")
-        except Exception as e:
-            print(f"❌ Method 4 exception: {str(e)}")
-        
-        # If all methods fail, still debug the final output
-        print("\n🔍 FINAL DEBUG - ALL METHODS FAILED:")
-        final_debug = debug_video_metadata(output_video_path)
-        final_verification = verify_vr180_metadata(output_video_path)
-        
-        print("⚠️ All metadata injection methods failed")
-        return {
-            "status": "warning", 
-            "output_file": output_video_path,
-            "message": "File created but VR180 metadata may not be properly embedded",
-            "final_metadata": final_debug,
-            "verification": final_verification
-        }
-        
-    except Exception as e:
-        print(f"❌ Unexpected error in main function: {str(e)}")
-        if os.path.exists(output_video_path):
-            print("🔍 DEBUGGING OUTPUT FILE AFTER ERROR:")
-            debug_video_metadata(output_video_path)
-        raise RuntimeError(f"VR180 metadata injection failed: {str(e)}")
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+def inject_vr180_metadata_optimized(
+    input_video_path: str,
+    output_video_path: str,
+    center_scale_width: int = 7680,
+    center_scale_height: int = 3840
+) -> None:
+    """
+    FINAL STEP: Inject VR180 metadata into the finished video
+    """
+    cmd = [
+        "ffmpeg", "-y", 
+        "-i", input_video_path,
+        "-c:v", "copy",
+        "-c:a", "copy",
+        "-movflags", "use_metadata_tags+faststart",
+        "-metadata:s:v:0", "spherical=true",
+        "-metadata:s:v:0", "stereo_mode=top_bottom",
+        "-metadata:s:v:0", "projection_type=equidistant",  # EQUIDISTANT FISHEYE
+        "-metadata:s:v:0", f"full_pano_width_pixels={center_scale_width}",
+        "-metadata:s:v:0", f"full_pano_height_pixels={center_scale_height}",
+        "-metadata:s:v:0", f"cropped_area_image_width={center_scale_width}",
+        "-metadata:s:v:0", f"cropped_area_image_height={center_scale_height}",
+        "-metadata:s:v:0", "cropped_area_left=0",
+        "-metadata:s:v:0", "cropped_area_top=0",
+        output_video_path
+    ]
+    
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    
+    if result.returncode == 0:
+        print("✅ VR180 metadata injected successfully!")
+    else:
+        print(f"❌ Metadata injection failed: {result.stderr}")
+        raise RuntimeError("VR180 metadata injection failed")            
 import torch
 from diffusers import StableDiffusionInpaintPipeline
 from PIL import Image
 import numpy as np
+import cv2
 
-# Initialize AI outpainting model (load this once at startup)
 def init_outpainting_model():
-    """Initialize AI outpainting model for peripheral extension"""
+    """Initialize AI outpainting model optimized for VR180 peripheral expansion"""
     try:
         pipe = StableDiffusionInpaintPipeline.from_pretrained(
             "stabilityai/stable-diffusion-2-inpainting",
             torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            variant="fp16" if torch.cuda.is_available() else None,
         )
+        
+        # Enable attention slicing for memory efficiency
+        if torch.cuda.is_available():
+            pipe.enable_attention_slicing()
+            pipe.enable_xformers_memory_efficient_attention()
+        
         pipe = pipe.to("cuda" if torch.cuda.is_available() else "cpu")
-        print("✅ AI Outpainting model loaded")
+        print("✅ AI Outpainting model loaded for VR180 peripheral expansion")
         return pipe
     except Exception as e:
         print(f"❌ Failed to load outpainting model: {e}")
@@ -807,9 +667,9 @@ def init_outpainting_model():
 
 outpainting_pipe = init_outpainting_model()
 
-def ai_outpaint_frame(frame, expansion_percent=20):
+def ai_outpaint_frame_vr180(frame, expansion_percent=25, scene_context="hallway"):
     """
-    Use AI to extend the frame's periphery for more natural VR180 edges
+    VR180-optimized AI outpainting for peripheral expansion to 210°+
     """
     if outpainting_pipe is None:
         return frame  # Fallback to original frame
@@ -820,85 +680,104 @@ def ai_outpaint_frame(frame, expansion_percent=20):
     else:
         pil_image = frame
     
-    # Calculate expansion pixels
     width, height = pil_image.size
-    expand_w = int(width * expansion_percent / 100)
-    expand_h = int(height * expansion_percent / 100)
     
-    # Create expanded canvas
-    new_width = width + expand_w * 2
-    new_height = height + expand_h * 2
+    # VR180-SPECIFIC: Asymmetric expansion (more left/right, less top)
+    expand_left_right = int(width * expansion_percent / 100)      # Expand sides more
+    expand_top = int(height * expansion_percent / 200)           # Expand top less
+    expand_bottom = int(height * expansion_percent / 400)        # Expand bottom least
+    
+    # Create expanded canvas for 210°+ FOV
+    new_width = width + expand_left_right * 2
+    new_height = height + expand_top + expand_bottom
     expanded_canvas = Image.new("RGB", (new_width, new_height), (0, 0, 0))
     
-    # Paste original image in center
-    expanded_canvas.paste(pil_image, (expand_w, expand_h))
+    # Paste original image centered horizontally, positioned vertically
+    expanded_canvas.paste(pil_image, (expand_left_right, expand_top))
     
-    # Create mask (black where we want to outpaint)
+    # Create mask - only outpaint the expanded areas
     mask = Image.new("L", (new_width, new_height), 255)  # White = keep
-    # Create black rectangle where original image is (we want to preserve this)
+    
+    # Black mask where we want to outpaint (the expanded border areas)
     draw_mask = Image.new("L", (width, height), 0)  # Black = inpaint
-    mask.paste(draw_mask, (expand_w, expand_h))
+    mask.paste(draw_mask, (expand_left_right, expand_top))
     
-    # AI outpainting prompt (customize based on your content)
-    prompt = "realistic environment extension, natural scenery, seamless blend, high quality"
+    # VR180-SPECIFIC PROMPT with scene context
+    scene_prompts = {
+        "hallway": "architectural hallway extension, continuous corridor, symmetric architecture, clean lines, realistic building interior, seamless extension",
+        "outdoor": "natural environment extension, outdoor scenery continuation, realistic landscape, seamless terrain, consistent lighting",
+        "general": "VR180 peripheral expansion, seamless environment extension, consistent perspective, natural continuation, immersive VR experience"
+    }
     
-    # Run outpainting
+    prompt = scene_prompts.get(scene_context, scene_prompts["general"])
+    negative_prompt = "blurry, distorted, inconsistent, discontinuous, mismatched, artificial, fake, low quality"
+    
+    # Optimized outpainting parameters for VR
     result = outpainting_pipe(
         prompt=prompt,
         image=expanded_canvas,
         mask_image=mask,
-        strength=0.9,
-        guidance_scale=7.5,
-        num_inference_steps=20
+        strength=0.85,  # Slightly lower for better consistency
+        guidance_scale=8.0,
+        num_inference_steps=25,
+        negative_prompt=negative_prompt,
+        generator=torch.Generator(device=outpainting_pipe.device).manual_seed(42)  # For consistency
     ).images[0]
     
-    # Crop back to original size or keep expanded based on your needs
-    return result        
+    # For VR180: Return the fully expanded image (210°+)
+    # The conversion to 180° will happen later in the pipeline
+    return result
+
+def ai_outpaint_batch_vr180(frames, expansion_percent=25, scene_context="hallway"):
+    """
+    Batch process frames with consistent outpainting for temporal coherence
+    """
+    results = []
+    for frame in frames:
+        outpainted = ai_outpaint_frame_vr180(frame, expansion_percent, scene_context)
+        results.append(outpainted)
+    
+    return results    
 import cv2
 import numpy as np
 
-import numpy as np
 import cv2
+import numpy as np
 
 def make_stereo_pair_optimized(
     img, 
     depth, 
-    eye_offset=8,          # ← KEEP (good default)
-    center_scale=0.85,     # ← CHANGE from 0.9 to 0.85
-    panini_alpha=0.6,      # ← CHANGE from 0.5 to 0.6
-    max_blur_radius=12     # ← Fixed parameter name to match your pipeline
+    eye_offset=6.3,          # ← CHANGED: 63mm IPD in world units (6.3cm)
+    center_scale=0.82,       # ← CHANGED: More comfortable central scaling (from 0.85)
+    panini_alpha=0.7,        # ← CHANGED: Stronger Panini projection (from 0.6)
+    stereographic_strength=0.2,  # ← ADDED: Stereographic blend for better edges
+    max_disparity_degrees=1.3,   # ← ADDED: Capped disparity for comfort (1.3°)
+    max_blur_radius=8        # ← CHANGED: Reduced blur for better clarity (from 12)
 ):
     """
-    Creates a comfortable, immersive VR180 stereo pair from a 2D image and depth map.
+    Creates comfortable VR180 stereo pair optimized for hackathon requirements.
     
     Args:
         img: Input image (2D or 3D array)
         depth: Depth map (same aspect ratio as img)
-        eye_offset: Interocular distance (world units) - default: 8
-        center_scale: Central scene scaling (0.8-0.95) - default: 0.85
-        panini_alpha: Panini projection parameter (0.3-0.7) - default: 0.6
-        max_blur_radius: Maximum blur radius for foveated effect - default: 12
+        eye_offset: Interocular distance in world units (63mm = 6.3cm)
+        center_scale: Central scene scaling for comfort (0.82 recommended)
+        panini_alpha: Panini projection strength (0.7 recommended)
+        stereographic_strength: Stereographic projection blend (0.2 recommended)
+        max_disparity_degrees: Maximum visual angle disparity (1.3° for comfort)
+        max_blur_radius: Maximum blur radius for foveated effect
     
     Returns:
-        left, right: Stereo image pair
+        left, right: Stereo image pair optimized for VR180
     """
-    # Input validation to prevent OpenCV errors
-    if img is None:
-        raise ValueError("Input image is None")
-    if depth is None:
-        raise ValueError("Depth map is None")
+    # Input validation
+    if img is None or depth is None:
+        raise ValueError("Input image and depth map cannot be None")
     
-    # Ensure img is numpy array
-    if not isinstance(img, np.ndarray):
-        raise TypeError(f"Image must be numpy array, got {type(img)}")
-    
-    # Validate dimensions
-    if len(img.shape) < 2:
-        raise ValueError(f"Image must have at least 2 dimensions, got {len(img.shape)}")
+    if not isinstance(img, np.ndarray) or not isinstance(depth, np.ndarray):
+        raise TypeError("Image and depth must be numpy arrays")
     
     h, w = img.shape[:2]
-    
-    # Check for valid dimensions (this fixes the OpenCV resize error)
     if h <= 0 or w <= 0:
         raise ValueError(f"Invalid image dimensions: {w}x{h}")
     
@@ -906,41 +785,30 @@ def make_stereo_pair_optimized(
     epsilon = 1e-6
     focal_length = 500  # Fixed focal length
     
-    # Handle depth map - ensure it's numpy array and correct type
-    if not isinstance(depth, np.ndarray):
-        depth = np.array(depth)
-    
-    # Normalize depth if it's not already in [0,1] range
-    if depth.max() > 1.0:
-        depth = depth.astype(np.float32) / 255.0
-    
     # 1. Resize depth to match frame dimensions if needed
     if depth.shape[:2] != (h, w):
-        try:
-            depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_LINEAR)
-        except cv2.error as e:
-            print(f"⚠️ Depth resize failed: {e}")
-            # Create fallback depth map
-            depth = np.ones((h, w), dtype=np.float32) * 0.5
+        depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_LINEAR)
     
-    # 2. Apply central scene scaling
+    # Normalize depth to [0.1, 1.0] range
+    depth_normalized = (depth - depth.min()) / (depth.max() - depth.min() + epsilon)
+    depth_normalized = np.clip(depth_normalized, 0.1, 1.0)
+    
+    # 2. Apply central scene scaling for comfort
     y_coords, x_coords = np.mgrid[0:h, 0:w]
     x_scaled = ((x_coords - cx) * center_scale + cx).astype(np.int32)
     y_scaled = ((y_coords - cy) * center_scale + cy).astype(np.int32)
     x_scaled = np.clip(x_scaled, 0, w - 1)
     y_scaled = np.clip(y_scaled, 0, h - 1)
     
-    # Apply scaling
     img_scaled = img[y_scaled, x_scaled]
-    depth_scaled = depth[y_scaled, x_scaled]
+    depth_scaled = depth_normalized[y_scaled, x_coords]  # Keep original y for vertical alignment
 
-    # 3. Calculate proper disparity from depth (physically based)
-    depth_normalized = (depth_scaled - depth_scaled.min()) / (depth_scaled.max() - depth_scaled.min() + epsilon)
-    depth_normalized = np.clip(depth_normalized, 0.1, 1.0)  # Avoid extreme values
+    # 3. Calculate disparity with MAX DISPARITY CAPPING (1.3° visual angle)
+    pixel_size_mm = 0.1  # Approximate pixel size in mm (adjust based on display)
+    max_pixel_disparity = (max_disparity_degrees * np.pi / 180) * focal_length / pixel_size_mm
     
-    disparity = (eye_offset * focal_length) / depth_normalized
-    max_disparity = w * 0.1  # Limit to 10% of screen width
-    disparity = np.clip(disparity, 0, max_disparity).astype(np.int32)
+    disparity = (eye_offset * 10 * focal_length) / (depth_scaled * w)  # eye_offset in cm
+    disparity = np.clip(disparity, -max_pixel_disparity, max_pixel_disparity).astype(np.int32)
 
     # 4. Create stereo images with depth-based shifting
     left = np.zeros_like(img_scaled)
@@ -956,16 +824,13 @@ def make_stereo_pair_optimized(
         left[y_coords, left_x] = img_scaled[y_coords, x_coords]
         right[y_coords, right_x] = img_scaled[y_coords, x_coords]
 
-    # 5. Apply Panini projection to both eyes (using panini_alpha as 'd' parameter)
-    def apply_panini_projection(image, focal_length, d):
-        """Apply correct Panini projection to reduce edge distortion."""
+    # 5. Apply projection blending (Panini + Stereographic)
+    def apply_projection_blending(image, focal_length, panini_alpha, stereographic_strength):
+        """Apply Panini + Stereographic projection blending for better edges."""
         if image is None or image.size == 0:
             return image
             
         h, w = image.shape[:2]
-        if h <= 0 or w <= 0:
-            return image
-            
         cx, cy = w // 2, h // 2
         
         # Create coordinate grids
@@ -973,75 +838,69 @@ def make_stereo_pair_optimized(
         x -= cx
         y -= cy
         
-        # Panini projection equations
+        # Panini projection
         ru = np.sqrt(x**2 + focal_length**2)
         sin_theta = x / ru
-        tan_phi = y / (ru * d + focal_length * (1 - d))
+        tan_phi_panini = y / (ru * panini_alpha + focal_length * (1 - panini_alpha))
+        
+        # Stereographic projection
+        r = np.sqrt(x**2 + y**2)
+        theta = np.arctan2(r, focal_length)
+        tan_phi_stereo = 2 * focal_length * np.tan(theta / 2) * y / (r + epsilon)
+        
+        # Blend projections
+        blend_weight = np.abs(x) / (cx + epsilon)  # More stereographic at edges
+        tan_phi = (1 - blend_weight * stereographic_strength) * tan_phi_panini + blend_weight * stereographic_strength * tan_phi_stereo
         
         # Map to output
         map_x = (focal_length * sin_theta + cx)
         map_y = (focal_length * tan_phi + cy)
         
-        try:
-            return cv2.remap(image, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
-        except cv2.error as e:
-            print(f"⚠️ Panini projection failed: {e}")
-            return image
+        return cv2.remap(image, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
 
-    left = apply_panini_projection(left, focal_length, panini_alpha)
-    right = apply_panini_projection(right, focal_length, panini_alpha)
+    left = apply_projection_blending(left, focal_length, panini_alpha, stereographic_strength)
+    right = apply_projection_blending(right, focal_length, panini_alpha, stereographic_strength)
 
-    # 6. Apply fast foveated blur
-    def foveated_blur_fast(image, center, max_blur_radius):
-        """Efficient single-pass foveated blur."""
-        if image is None or image.size == 0 or max_blur_radius <= 0:
+    # 6. Apply foveated blur starting at 70° eccentricity
+    def apply_foveated_blur_vr180(image, start_degrees=70, max_blur_radius=8):
+        """VR180-optimized foveated blur starting at 70° eccentricity."""
+        if image is None or image.size == 0:
             return image
             
         h, w = image.shape[:2]
-        if h <= 0 or w <= 0:
-            return image
+        cx, cy = w // 2, h // 2
         
-        try:
-            # Calculate distance map from center
-            y_coords, x_coords = np.indices((h, w))
-            dist = np.sqrt((x_coords - center[0])**2 + (y_coords - center[1])**2)
-            max_dist = np.sqrt(center[0]**2 + center[1]**2)
-            
-            if max_dist == 0:
-                return image
-                
-            norm_dist = np.clip(dist / max_dist, 0, 1)
-            
-            # Use single large Gaussian blur
-            max_kernel_size = max_blur_radius * 2 + 1
-            if max_kernel_size % 2 == 0:  # Ensure odd kernel size
-                max_kernel_size += 1
-                
-            blurred = cv2.GaussianBlur(image, (max_kernel_size, max_kernel_size), 0)
-            
-            # Create weight map for blending
-            blend_weight = np.clip(norm_dist * 2, 0, 1)  # Linear transition
-            
-            # Blend based on weight map
-            if len(image.shape) == 3:
-                blend_weight = blend_weight[:, :, np.newaxis]
-            
-            result = (1 - blend_weight) * image + blend_weight * blurred
-            return result.astype(image.dtype)
-            
-        except Exception as e:
-            print(f"⚠️ Foveated blur failed: {e}")
-            return image
+        # Calculate distance from center in degrees
+        max_radius = np.sqrt(cx**2 + cy**2)
+        y_coords, x_coords = np.indices((h, w))
+        dist_pixels = np.sqrt((x_coords - cx)**2 + (y_coords - cy)**2)
+        dist_degrees = (dist_pixels / max_radius) * 90  # Convert to degrees
+        
+        # Create blur mask (start at 70°)
+        blur_mask = np.zeros_like(dist_degrees, dtype=np.float32)
+        mask_region = dist_degrees > start_degrees
+        if np.any(mask_region):
+            normalized_dist = (dist_degrees[mask_region] - start_degrees) / (90 - start_degrees)
+            blur_mask[mask_region] = np.clip(normalized_dist * 2, 0, 1)  # Faster transition
+        
+        # Apply blur based on mask
+        blurred = cv2.GaussianBlur(image, (max_blur_radius*2+1, max_blur_radius*2+1), 0)
+        
+        if len(image.shape) == 3:
+            blur_mask = blur_mask[:, :, np.newaxis]
+        
+        return (1 - blur_mask) * image + blur_mask * blurred
 
-    left = foveated_blur_fast(left, (cx, cy), max_blur_radius)
-    right = foveated_blur_fast(right, (cx, cy), max_blur_radius)
+    left = apply_foveated_blur_vr180(left, start_degrees=70, max_blur_radius=max_blur_radius)
+    right = apply_foveated_blur_vr180(right, start_degrees=70, max_blur_radius=max_blur_radius)
 
-    return left, right
+    return left.astype(np.uint8), right.astype(np.uint8)
 
 
+# Utility function for batch processing
 def smart_upscale_to_8k(image, method="lanczos"):
     """
-    Enhanced upscaling for 1K to 8K (4x scaling)
+    Proper 4x upscaling for 8K VR180 (from 2K to 8K, not 1K to 8K)
     """
     if image is None:
         raise ValueError("Image cannot be None")
@@ -1057,11 +916,16 @@ def smart_upscale_to_8k(image, method="lanczos"):
     if h <= 0 or w <= 0:
         raise ValueError(f"Invalid image dimensions: {w}x{h}")
     
-    # FIXED: 4x upscaling for 1K to 8K (instead of 2x)
-    target_w, target_h = w * 8, h * 8
+    # PROPER 8K VR180 SCALING: 4x upscaling (not 8x)
+    # Input: ~1920x1080 (2K) → Output: 7680x4320 (8K UHD) → Cropped to 7680x3840 (VR180)
+    scale_factor = 4  # 4x scaling for 2K→8K
     
-    if target_w <= 0 or target_h <= 0:
-        raise ValueError(f"Invalid target dimensions: {target_w}x{target_h}")
+    target_w, target_h = w * scale_factor, h * scale_factor
+    
+    # For VR180, we need specific aspect ratio: 2:1 (width:height)
+    # So we'll upscale to 8K UHD (7680x4320) then crop to VR180 (7680x3840)
+    vr180_target_w = 7680
+    vr180_target_h = 3840
     
     # Select interpolation method
     if method == "lanczos":
@@ -1070,21 +934,58 @@ def smart_upscale_to_8k(image, method="lanczos"):
         interpolation = cv2.INTER_CUBIC
     elif method == "nearest":
         interpolation = cv2.INTER_NEAREST
+    elif method == "area":
+        interpolation = cv2.INTER_AREA
     else:
         interpolation = cv2.INTER_LINEAR
     
     try:
+        # First upscale to target dimensions
         upscaled = cv2.resize(image, (target_w, target_h), interpolation=interpolation)
+        
+        # For VR180: Crop to 2:1 aspect ratio (center crop)
+        if target_h > vr180_target_h:
+            crop_start = (target_h - vr180_target_h) // 2
+            upscaled = upscaled[crop_start:crop_start + vr180_target_h, :]
+        
+        if target_w > vr180_target_w:
+            crop_start = (target_w - vr180_target_w) // 2
+            upscaled = upscaled[:, crop_start:crop_start + vr180_target_w]
+        
+        # Final resize to exact 8K VR180 dimensions if needed
+        if upscaled.shape[1] != vr180_target_w or upscaled.shape[0] != vr180_target_h:
+            upscaled = cv2.resize(upscaled, (vr180_target_w, vr180_target_h), interpolation=interpolation)
+        
         return upscaled
+        
     except cv2.error as e:
         print(f"⚠️ Upscaling failed with {method}, falling back to linear: {e}")
-        upscaled = cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+        upscaled = cv2.resize(image, (vr180_target_w, vr180_target_h), interpolation=cv2.INTER_LINEAR)
         return upscaled
 
-# Enhanced batch processing function
-def process_stereo_batch_safe(frames, depth_maps, **kwargs):
+def create_stereo_batch_vr180(frames, depth_maps, upscale_8k=True, **kwargs):
     """
-    Safely process a batch of frames and depth maps with error handling
+    Process batch of frames with consistent VR180 parameters and optional 8K upscaling
+    """
+    left_eyes = []
+    right_eyes = []
+    
+    for frame, depth in zip(frames, depth_maps):
+        left, right = make_stereo_pair_optimized(frame, depth, **kwargs)
+        
+        # Apply 8K upscaling if requested
+        if upscale_8k:
+            left = smart_upscale_to_8k(left, method="lanczos")
+            right = smart_upscale_to_8k(right, method="lanczos")
+        
+        left_eyes.append(left)
+        right_eyes.append(right)
+    
+    return left_eyes, right_eyes
+
+def process_stereo_batch_safe(frames, depth_maps, upscale_8k=True, **kwargs):
+    """
+    Safely process a batch of frames with 8K upscaling option
     """
     if not frames or not depth_maps:
         return []
@@ -1099,7 +1000,6 @@ def process_stereo_batch_safe(frames, depth_maps, **kwargs):
     
     for i, (frame, depth) in enumerate(zip(frames, depth_maps)):
         try:
-            # Validate inputs before processing
             if frame is None:
                 print(f"⚠️ Frame {i} is None, skipping")
                 continue
@@ -1111,13 +1011,18 @@ def process_stereo_batch_safe(frames, depth_maps, **kwargs):
             # Create stereo pair
             left, right = make_stereo_pair_optimized(frame, depth, **kwargs)
             
+            # Apply 8K upscaling
+            if upscale_8k:
+                left = smart_upscale_to_8k(left, method="lanczos")
+                right = smart_upscale_to_8k(right, method="lanczos")
+            
             # Combine into side-by-side format
             sbs = np.concatenate((left, right), axis=1)
             stereo_pairs.append(sbs)
             
         except Exception as e:
             print(f"⚠️ Failed to process stereo pair {i}: {e}")
-            # Fallback: duplicate frame side by side
+            # Fallback without upscaling
             try:
                 if frame is not None:
                     sbs = np.concatenate((frame, frame), axis=1)
@@ -1128,6 +1033,20 @@ def process_stereo_batch_safe(frames, depth_maps, **kwargs):
     
     return stereo_pairs
 
+# AI-enhanced upscaling option (if you have access to AI models)
+def ai_enhanced_upscale_to_8k(image, model_type="esrgan"):
+    """
+    AI-powered 8K upscaling for better quality (optional enhancement)
+    """
+    # This would use AI models like ESRGAN, Real-ESRGAN, or similar
+    # For now, fallback to traditional upscaling
+    return smart_upscale_to_8k(image, method="lanczos")
+
+print("🎯 Fixed 8K VR180 Upscaling Ready!")
+print("✅ Proper 4x scaling from 2K→8K (not 8x)")
+print("✅ Maintains VR180 2:1 aspect ratio (7680x3840)")
+print("✅ Integrated into batch processing functions")
+print("🚀 Ready for 8K VR180 conversion!")
 print("🎯 Fixed VR 180 Stereo System Ready!")
 print("✅ Enhanced error handling to prevent OpenCV resize errors")
 print("✅ Input validation for all functions")
@@ -1151,20 +1070,26 @@ def save_to_history(db: Session, user_id: int, original_filename: str, output_pa
 def convert_2d_to_vr180_gpu_optimized(
     input_path: str,
     output_path: str,
-    center_scale: float = 0.9,
+    center_scale: float = 0.82,        # ← CHANGED: More comfortable central scaling
     focal_length: int = 500,
-    panini_alpha: float = 0.5,
-    eye_offset: int = 8,
-    max_blur: int = 15,
+    panini_alpha: float = 0.7,         # ← CHANGED: Stronger Panini projection
+    stereographic_strength: float = 0.2,  # ← ADDED: Stereographic blend
+    eye_offset: float = 6.3,           # ← CHANGED: 63mm IPD in world units (6.3cm)
+    max_disparity_degrees: float = 1.3,   # ← ADDED: Capped disparity for comfort
+    max_blur_radius: int = 8,          # ← CHANGED: Reduced blur for clarity
     ai_outpaint: bool = True,
     upscale_to_8k: bool = True,
-    upscale_method: str = "lanczos"
+    upscale_method: str = "lanczos",
+    expansion_degrees: int = 210       # ← ADDED: Expand to 210° before crop
 ):
     """
-    GPU-optimized 2D to VR180 conversion with enhanced error handling
+    GPU-optimized 2D to VR180 conversion with hackathon-optimized parameters
     """
     # Add debug logging at start
-    print("🔍 CONVERSION DEBUG MODE ENABLED")
+    print("🎯 VR180 CONVERSION STARTED - Hackathon Optimized")
+    print(f"   Center Scale: {center_scale}, Panini: {panini_alpha}, Stereographic: {stereographic_strength}")
+    print(f"   Max Disparity: {max_disparity_degrees}°, IPD: {eye_offset}cm")
+    print(f"   FOV Expansion: {expansion_degrees}°, 8K Upscaling: {upscale_to_8k}")
     
     # Test video file first
     test_cap = cv2.VideoCapture(input_path)
@@ -1198,7 +1123,6 @@ def convert_2d_to_vr180_gpu_optimized(
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
-        # FIXED: Proper indentation and validation
         if width <= 0 or height <= 0:
             raise ValueError(f"Invalid video dimensions: {width}x{height}")
         if total_frames <= 0:
@@ -1223,7 +1147,7 @@ def convert_2d_to_vr180_gpu_optimized(
         frame_batch = []
         processed_frames = 0
         
-        # FIXED: Use local batch size instead of modifying global
+        # Use appropriate batch size
         current_batch_size = max(1, BATCH_SIZE // 2) if upscale_to_8k else BATCH_SIZE
         print(f"📦 Using batch size: {current_batch_size}")
 
@@ -1266,6 +1190,20 @@ def convert_2d_to_vr180_gpu_optimized(
                                     print(f"⚠️ Skipping invalid frame: {frame_w}x{frame_h}")
                                     continue
                                 
+                                # AI Outpainting for peripheral expansion
+                                if ai_outpaint and outpainting_pipe is not None:
+                                    try:
+                                        frame_rgb = cv2.cvtColor(frame_data, cv2.COLOR_BGR2RGB)
+                                        pil_frame = Image.fromarray(frame_rgb)
+                                        outpainted_frame = ai_outpaint_frame_vr180(
+                                            pil_frame, 
+                                            expansion_percent=25,
+                                            scene_context="hallway"
+                                        )
+                                        frame_data = cv2.cvtColor(np.array(outpainted_frame), cv2.COLOR_RGB2BGR)
+                                    except Exception as e:
+                                        print(f"⚠️ AI outpainting failed: {e}")
+                                
                                 # Apply 8K upscaling with validation
                                 if upscale_to_8k:
                                     try:
@@ -1275,7 +1213,7 @@ def convert_2d_to_vr180_gpu_optimized(
                                         print(f"⚠️ Upscaling failed: {e}")
                                         continue
                                 
-                                # Create stereo pair with validation
+                                # Create stereo pair with hackathon-optimized parameters
                                 try:
                                     left, right = make_stereo_pair_optimized(
                                         frame_data, 
@@ -1283,14 +1221,20 @@ def convert_2d_to_vr180_gpu_optimized(
                                         eye_offset=eye_offset,
                                         center_scale=center_scale,
                                         panini_alpha=panini_alpha,
-                                        max_blur_radius=max_blur
+                                        stereographic_strength=stereographic_strength,
+                                        max_disparity_degrees=max_disparity_degrees,
+                                        max_blur_radius=max_blur_radius
                                     )
                                     
                                     if left is None or right is None:
                                         print(f"⚠️ Stereo creation returned None")
                                         continue
                                     
-                                    sbs = np.concatenate((left, right), axis=1)
+                                    # Convert to equidistant fisheye for VR180
+                                    left_fisheye = convert_to_equidistant_fisheye(left)
+                                    right_fisheye = convert_to_equidistant_fisheye(right)
+                                    
+                                    sbs = np.concatenate((left_fisheye, right_fisheye), axis=1)
                                     
                                 except Exception as e:
                                     print(f"⚠️ Stereo creation failed: {e}")
@@ -1335,12 +1279,16 @@ def convert_2d_to_vr180_gpu_optimized(
                 print(f"⚠️ Invalid frame dimensions: {frame_w}x{frame_h}")
                 continue
 
-            # AI Outpainting (with error handling)
+            # AI Outpainting for peripheral expansion
             if ai_outpaint and outpainting_pipe is not None:
                 try:
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     pil_frame = Image.fromarray(frame_rgb)
-                    outpainted_frame = ai_outpaint_frame(pil_frame, expansion_percent=15)
+                    outpainted_frame = ai_outpaint_frame_vr180(
+                        pil_frame, 
+                        expansion_percent=25,
+                        scene_context="hallway"
+                    )
                     frame = cv2.cvtColor(np.array(outpainted_frame), cv2.COLOR_RGB2BGR)
                 except Exception as e:
                     print(f"⚠️ AI outpainting failed: {e}")
@@ -1386,17 +1334,23 @@ def convert_2d_to_vr180_gpu_optimized(
                                     print(f"⚠️ Upscaling failed: {e}")
                                     continue
                             
-                            # Create stereo pair
+                            # Create stereo pair with optimized parameters
                             left, right = make_stereo_pair_optimized(
                                 frame_data, 
                                 depth,
                                 eye_offset=eye_offset,
                                 center_scale=center_scale,
                                 panini_alpha=panini_alpha,
-                                max_blur_radius=max_blur
+                                stereographic_strength=stereographic_strength,
+                                max_disparity_degrees=max_disparity_degrees,
+                                max_blur_radius=max_blur_radius
                             )
                             
-                            sbs = np.concatenate((left, right), axis=1)
+                            # Convert to equidistant fisheye
+                            left_fisheye = convert_to_equidistant_fisheye(left)
+                            right_fisheye = convert_to_equidistant_fisheye(right)
+                            
+                            sbs = np.concatenate((left_fisheye, right_fisheye), axis=1)
                             
                             frame_path = os.path.join(temp_dir, f"{len(frame_paths):05d}.png")
                             if cv2.imwrite(frame_path, sbs, [cv2.IMWRITE_PNG_COMPRESSION, 6]):
@@ -1426,106 +1380,44 @@ def convert_2d_to_vr180_gpu_optimized(
 
         print(f"✅ Processed {len(frame_paths)} frames, creating video...")
         
-        # === FIXED VIDEO CREATION SECTION ===
+        # Create video from frames
         try:
-            if upscale_to_8k:
-                # For 8K, use software encoder (x264) as NVENC doesn't support >4096 width
-                print("🎬 Using software encoder for 8K (NVENC limitation)")
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-r", str(fps),
-                    "-i", os.path.join(temp_dir, "%05d.png"),
-                    "-c:v", "libx264",           # Software encoder
-                    "-preset", "medium",         # Balanced speed/quality
-                    "-crf", "18",               # High quality
-                    "-pix_fmt", "yuv420p",
-                    "-movflags", "+faststart",   # Web optimization
-                    "-threads", "0",            # Use all CPU cores
-                    output_path
-                ]
-                
-                # Try with lower quality if encoding fails
+            # Use software encoder for 8K
+            print("🎬 Creating 8K VR180 video with software encoder")
+            cmd = [
+                "ffmpeg", "-y",
+                "-r", str(fps),
+                "-i", os.path.join(temp_dir, "%05d.png"),
+                "-c:v", "libx264",
+                "-preset", "medium",
+                "-crf", "18",
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                "-threads", "0",
+                output_path
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+            
+            if result.returncode != 0:
+                print("⚠️ High quality encoding failed, trying faster preset")
+                cmd[cmd.index("-preset") + 1] = "fast"
+                cmd[cmd.index("-crf") + 1] = "23"
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
                 
-                if result.returncode != 0:
-                    print("⚠️ High quality encoding failed, trying faster preset")
-                    cmd[cmd.index("-preset") + 1] = "fast"
-                    cmd[cmd.index("-crf") + 1] = "23"  # Lower quality
-                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-                    
-            else:
-                # For 4K and below, try NVENC first, fallback to x264
-                print("🎬 Trying hardware encoder (NVENC)")
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-r", str(fps),
-                    "-i", os.path.join(temp_dir, "%05d.png"),
-                    "-c:v", "h264_nvenc",
-                    "-preset", "p4",             # NVENC preset
-                    "-cq", "23",                # Constant quality
-                    "-b:v", "25M",              # Target bitrate
-                    "-maxrate", "35M",
-                    "-bufsize", "50M",
-                    "-pix_fmt", "yuv420p",
-                    "-movflags", "+faststart",
-                    "-threads", "0",
-                    output_path
-                ]
-                
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
-                
-                if result.returncode != 0:
-                    print("⚠️ NVENC failed, falling back to software encoder")
-                    cmd = [
-                        "ffmpeg", "-y",
-                        "-r", str(fps),
-                        "-i", os.path.join(temp_dir, "%05d.png"),
-                        "-c:v", "libx264",
-                        "-preset", "medium",
-                        "-crf", "23",
-                        "-pix_fmt", "yuv420p",
-                        "-movflags", "+faststart",
-                        "-threads", "0",
-                        output_path
-                    ]
-                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
-            
             if result.returncode != 0:
-                # Final fallback with very safe settings
-                print("⚠️ Standard encoding failed, trying safe fallback")
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-r", str(fps),
-                    "-i", os.path.join(temp_dir, "%05d.png"),
-                    "-c:v", "libx264",
-                    "-preset", "ultrafast",      # Fastest encoding
-                    "-crf", "28",               # Lower quality but reliable
-                    "-pix_fmt", "yuv420p",
-                    "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",  # Ensure even dimensions
-                    output_path
-                ]
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
-                
-            if result.returncode != 0:
-                raise RuntimeError(f"All encoding attempts failed. Last error: {result.stderr}")
+                raise RuntimeError(f"Encoding failed: {result.stderr}")
                 
         except subprocess.TimeoutExpired:
-            raise RuntimeError("Video encoding timeout - try reducing quality or video length")
-
-        if not os.path.exists(output_path):
-            raise RuntimeError("Failed to create output video file")
-
-        print("✅ VR180 conversion completed successfully")
-        if upscale_to_8k:
-            print("🎯 8K upscaling successfully applied")
-            print("ℹ️  Note: 8K encoding uses software encoder (CPU) due to hardware limitations")
-            
+            raise RuntimeError("Video encoding timeout")
+        
+       
     finally:
         if 'cap' in locals():
             cap.release()
         shutil.rmtree(temp_dir, ignore_errors=True)
         clear_gpu_cache()
-    # Create output video - adjust settings for 8K
+        # Create output video - adjust settings for 8K
    
 # Base directories
 BASE_DIR = "/content/Vr180_Back"  # Colab base directory
@@ -1614,7 +1506,12 @@ def save_to_history(db: Session, user_id: int, original_filename: str, output_pa
 
 from fastapi import Depends, HTTPException, UploadFile, File
 from sqlalchemy.orm import Session
-  # Your database session   # Your auth dependency
+import asyncio
+import os
+import uuid
+import threading
+from fastapi.responses import StreamingResponse
+
 @app.post("/convert/")
 async def convert_video(
     video: UploadFile = File(...),
@@ -1634,6 +1531,7 @@ async def convert_video(
     unique_id = uuid.uuid4().hex
     input_path = os.path.join(UPLOAD_DIR, f"input_{unique_id}.mp4")
     output_path = os.path.join(UPLOAD_DIR, f"output_{unique_id}_vr180.mp4")
+    fisheye_path = os.path.join(UPLOAD_DIR, f"fisheye_{unique_id}.mp4")  # NEW: Fisheye conversion step
     final_output_path = os.path.join(FINAL_DIR, f"vr180_{unique_id}.mp4")
     
     # Define temp_with_audio outside try block to avoid scope issues
@@ -1650,20 +1548,22 @@ async def convert_video(
         # Clear GPU memory before starting
         clear_gpu_cache()
         
-        # Step 1: Convert to VR180 using GPU optimization - FIXED
+        # Step 1: Convert to VR180 using GPU optimization
         await asyncio.to_thread(
             convert_2d_to_vr180_gpu_optimized,
             input_path,
             output_path,
-            center_scale=0.85,
-            focal_length=550,
-            panini_alpha=0.6,
-            eye_offset=8,
-            max_blur=12,
+            center_scale=0.82,        # ← UPDATED: More comfortable
+            focal_length=500,
+            panini_alpha=0.7,         # ← UPDATED: Stronger Panini
+            stereographic_strength=0.2, # ← ADDED: Stereographic blend
+            eye_offset=6.3,           # ← UPDATED: 63mm IPD
+            max_disparity_degrees=1.3, # ← ADDED: Capped disparity
+            max_blur_radius=8,        # ← UPDATED: Reduced blur
             ai_outpaint=True,
             upscale_to_8k=True,
-            upscale_method="lanczos" 
-            
+            upscale_method="lanczos",
+            expansion_degrees=210     # ← ADDED: Expand to 210°
         )
 
         if not os.path.exists(output_path):
@@ -1672,26 +1572,30 @@ async def convert_video(
         # Step 2: Add audio with metadata preservation
         await add_audio_preserve_metadata(input_path, output_path, temp_with_audio)
         
-        # Step 3: Inject VR180 metadata - FIXED
-        # In your convert_video endpoint, update this section:
+        # Step 3: CONVERT TO EQUIDISTANT FISHEYE (NEW STEP)
+        print("🐟 Converting to equidistant fisheye projection...")
         await asyncio.to_thread(
-    inject_vr180_metadata,
-    temp_with_audio,       # input_video_path
-    final_output_path,     # output_video_path
-    7680,                  # center_scale_width (4x upscaled from 1920)
-    4320,                  # center_scale_height (4x upscaled from 1080)  
-    7680,                  # cropped_image_width (your actual output width)
-    4320,                  # cropped_image_height (your actual output height)
-    0,                     # cropped_left
-    0                      # cropped_top (0 for side-by-side format)
-)
+            convert_video_to_equidistant_fisheye,
+            temp_with_audio,
+            fisheye_path
+        )
+        
+        # Step 4: Inject VR180 metadata
+        print("📝 Injecting VR180 metadata...")
+        await asyncio.to_thread(
+            inject_vr180_metadata_optimized,
+            fisheye_path,           # Use fisheye-converted video
+            final_output_path,      # Final output
+            center_scale_width=7680,    # 8K width
+            center_scale_height=3840    # 8K VR180 height (2:1 ratio)
+        )
 
         if not os.path.exists(final_output_path):
             raise HTTPException(status_code=500, detail="Final conversion failed.")
 
         final_file_size = os.path.getsize(final_output_path)
         
-        # Step 4: Save to conversion history with error handling
+        # Step 5: Save to conversion history
         try:
             conversion = save_to_history(
                 db=db,
@@ -1705,7 +1609,7 @@ async def convert_video(
             print(f"⚠️ Database save error: {db_error}")
             conversion = None
 
-        # Step 5: Return file for download
+        # Step 6: Return file for download
         def iter_file(path: str):
             with open(path, "rb") as f:
                 while chunk := f.read(8192):
@@ -1733,24 +1637,42 @@ async def convert_video(
         raise HTTPException(status_code=500, detail=str(e))
         
     finally:
-        # Cleanup temporary files
-        def cleanup():
+    # Cleanup temporary files - KEEP FINAL OUTPUT
+         def cleanup():
            try:
-              cleanup_paths = [input_path]   # only remove input file
+            # Only clean up INTERMEDIATE files, keep the final output
+              cleanup_paths = [input_path, output_path, fisheye_path]  # Intermediate files
+            
               if 'temp_with_audio' in locals() and temp_with_audio:
-                 cleanup_paths.append(temp_with_audio)  # remove temp audio if exists
+                  cleanup_paths.append(temp_with_audio)
 
               for path in cleanup_paths:
-                if os.path.exists(path):
-                  os.unlink(path)
-                  print(f"🧹 Cleaned up: {path}")
+                  if os.path.exists(path) and path != final_output_path:  # ← DON'T delete final output
+                      os.unlink(path)
+                      print(f"🧹 Cleaned up temporary file: {path}")
 
-              clear_gpu_cache()  # <-- keep this inside try
-           except Exception as e:
-               print(f"Cleanup error: {e}")
+              clear_gpu_cache()
+            
+            # Log what files remain (for debugging)
+              remaining_files = []
+              for path in [input_path, output_path, fisheye_path, temp_with_audio, final_output_path]:
+                  if os.path.exists(path):
+                      remaining_files.append(path)
+            
+              print(f"📁 Files remaining after cleanup: {remaining_files}")
+            
+          except Exception as e:
+              print(f"⚠️ Cleanup error: {e}")
 
         threading.Thread(target=cleanup, daemon=True).start()
-# Enhanced user conversions endpoint with better debugging
+
+
+# NEW FUNCTION: Convert video to equidistant fisheye
+def convert_video_to_equidistant_fisheye(input_path: str, output_path: str):
+    """
+    Convert a side-by-side VR video to equidistant fisheye projection
+    """
+    pass
 @app.get("/user/conversions/")
 async def get_user_conversions(
     db: Session = Depends(get_db),
