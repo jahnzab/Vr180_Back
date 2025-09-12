@@ -1,4 +1,9 @@
 # GPU-optimized VR180 converter for Google Colab T4
+import os
+os.environ['XDG_RUNTIME_DIR'] = '/tmp/runtime-kaggle'
+os.environ['PYTHONWARNINGS'] = 'ignore'  # Suppress warnings
+# Optionally disable ALSA audio warnings if not needed
+os.environ['ALSA_CONFIG_PATH'] = '/dev/null'
 import torch
 import cv2
 import numpy as np
@@ -1501,7 +1506,7 @@ def convert_2d_to_vr180_gpu_optimized(
     # Create output video - adjust settings for 8K
    
 # Base directories
-BASE_DIR = "/content/Vr180_Back"  # Colab base directory
+BASE_DIR = "/kaggle/working/Vr180_Back"  # Colab base directory
 UPLOAD_DIR = os.path.join(BASE_DIR, "tmp_uploads")
 FINAL_DIR = os.path.join(BASE_DIR, "videos")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
