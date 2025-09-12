@@ -2014,9 +2014,7 @@ def get_all_feedback(db: Session = Depends(get_db)):
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.utcnow()}
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+
 # Colab memory monitoring
 @app.get("/system/status")
 async def system_status():
