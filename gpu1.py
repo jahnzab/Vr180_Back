@@ -698,7 +698,7 @@ def apply_panini_projection(image, alpha=0.7, stereographic_strength=0.2):
 
     return cv2.remap(image, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
 
-def convert_to_equidistant_fisheye_full(image, output_size=(3840, 3840)):
+def convert_to_equidistant_fisheye(image, output_size=(3840, 3840)):
     """Map rectangular image into a centered full circular equidistant fisheye in square frame."""
     h_out, w_out = output_size
     cx_out, cy_out = w_out // 2, h_out // 2
