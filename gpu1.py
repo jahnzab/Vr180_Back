@@ -537,42 +537,7 @@ async def refresh_token(refresh_data: dict, db: Session = Depends(get_db)):
 # -------------------------------
 # GPU-Optimized Depth estimation
 # -------------------------------
-def convert_to_equidistant_fisheye(
-    frame: np.ndarray,
-    output_size: Tuple[int, int] = (3840, 3840)  # Per-eye resolution
-) -> np.ndarray:
-    """
-    Convert frame to equidistant fisheye projection - VISUAL TRANSFORMATION
-    """
-    height, width = frame.shape[:2]
-    output_height, output_width = output_size
-    
-    # Create output image
-    fisheye_image = np.zeros((output_height, output_width, 3), dtype=np.uint8)
-    
-    center_x, center_y = output_width // 2, output_height // 2
-    max_radius = min(center_x, center_y)
-    
-    # Create coordinate grids
-    y_coords, x_coords = np.ogrid[:output_height, :output_width]
-    distances = np.sqrt((x_coords - center_x)**2 + (y_coords - center_y)**2)
-    angles = np.arctan2(y_coords - center_y, x_coords - center_x)
-    
-    # Normalize distances (equidistant projection)
-    normalized_distances = distances / max_radius
-    normalized_distances = np.clip(normalized_distances, 0, 1)
-    
-    # Calculate source coordinates (equidistant mapping)
-    source_x = (normalized_distances * np.cos(angles) + 1) * (width / 2)
-    source_y = (normalized_distances * np.sin(angles) + 1) * (height / 2)
-    
-    source_x = np.clip(source_x, 0, width - 1).astype(int)
-    source_y = np.clip(source_y, 0, height - 1).astype(int)
-    
-    # Map pixels using equidistant projection
-    fisheye_image[y_coords, x_coords] = frame[source_y, source_x]
-    
-    return fisheye_image
+
 import numpy as np
 import cv2
 import os
@@ -619,117 +584,57 @@ def convert_to_equidistant_fisheye(
     
     return fisheye_image
 
-def convert_video_to_equidistant_fisheye(
-    input_video_path: str,
-    output_video_path: str,
-    per_eye_resolution: Tuple[int, int] = (3840, 3840)
-) -> None:
-    """
-    Convert a side-by-side video to equidistant fisheye projection for VR180
-    """
-    # Create temporary directory for frames
-    temp_dir = tempfile.mkdtemp()
-    
-    try:
-        # Extract frames from video
-        extract_cmd = [
-            "ffmpeg", "-i", input_video_path,
-            os.path.join(temp_dir, "frame_%06d.png")
-        ]
-        subprocess.run(extract_cmd, check=True, capture_output=True)
-        
-        # Get frame files
-        frame_files = sorted([f for f in os.listdir(temp_dir) if f.startswith("frame_") and f.endswith(".png")])
-        
-        print(f"🔄 Processing {len(frame_files)} frames for fisheye conversion...")
-        
-        # Process each frame
-        for i, frame_file in enumerate(frame_files):
-            frame_path = os.path.join(temp_dir, frame_file)
-            frame = cv2.imread(frame_path)
-            
-            if frame is None:
-                continue
-                
-            # Split into left and right eyes (assuming side-by-side layout)
-            height, width = frame.shape[:2]
-            left_frame = frame[:, :width//2, :]
-            right_frame = frame[:, width//2:, :]
-            
-            # Convert to fisheye
-            left_fisheye = convert_to_equidistant_fisheye(left_frame, per_eye_resolution)
-            right_fisheye = convert_to_equidistant_fisheye(right_frame, per_eye_resolution)
-            
-            # Combine side-by-side
-            sbs_frame = np.concatenate((left_fisheye, right_fisheye), axis=1)
-            
-            # Save processed frame
-            output_frame_path = os.path.join(temp_dir, f"fisheye_{i:06d}.png")
-            cv2.imwrite(output_frame_path, sbs_frame)
-            
-            if i % 10 == 0:
-                print(f"📊 Processed {i+1}/{len(frame_files)} frames")
-        
-        # Get output video framerate from input video
-        probe_cmd = [
-            "ffprobe", "-v", "error", "-select_streams", "v:0",
-            "-show_entries", "stream=r_frame_rate", "-of", "default=noprint_wrappers=1:nokey=1",
-            input_video_path
-        ]
-        result = subprocess.run(probe_cmd, capture_output=True, text=True)
-        fps = result.stdout.strip().split('/')
-        if len(fps) == 2:
-            fps = float(fps[0]) / float(fps[1])
-        else:
-            fps = 30  # Default if cannot determine
-        
-        # Create video from processed frames
-        create_cmd = [
-            "ffmpeg", "-y",
-            "-r", str(fps),
-            "-i", os.path.join(temp_dir, "fisheye_%06d.png"),
-            "-c:v", "libx264",
-            "-preset", "medium",
-            "-crf", "18",
-            "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
-            output_video_path
-        ]
-        
-        subprocess.run(create_cmd, check=True)
-        print(f"✅ Created fisheye video: {output_video_path}")
-        
-    except Exception as e:
-        print(f"❌ Error converting video to fisheye: {e}")
-        raise
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+import cv2
+import os
+import tempfile
+import shutil
+import subprocess
+from typing import List, Tuple
+import numpy as np
 
-def create_side_by_side_video(
-    left_frames: List[np.ndarray],
-    right_frames: List[np.ndarray],
-    output_path: str,
-    fps: float,
-    per_eye_resolution: Tuple[int, int] = (3840, 3840)
+def convert_sbs_frames_to_equidistant_fisheye_video(
+    sbs_frames: List[np.ndarray],
+    output_video_path: str,
+    per_eye_resolution: Tuple[int, int] = (3840, 3840),
+    fps: float = 30.0
 ) -> None:
     """
-    Create side-by-side video from left/right eye frames
+    Convert a list of side-by-side frames to equidistant fisheye video for VR180.
+    
+    Args:
+        sbs_frames: List of side-by-side frames (left + right).
+        output_video_path: Path to save the final video.
+        per_eye_resolution: Resolution per eye (default 3840x3840).
+        fps: Frames per second of output video.
     """
     temp_dir = tempfile.mkdtemp()
     
     try:
-        for i, (left_frame, right_frame) in enumerate(zip(left_frames, right_frames)):
-            # Convert both eyes to fisheye
+        print(f"🔄 Processing {len(sbs_frames)} frames for fisheye conversion...")
+
+        for i, sbs_frame in enumerate(sbs_frames):
+            height, width = sbs_frame.shape[:2]
+            
+            # Split into left and right eyes
+            left_frame = sbs_frame[:, :width // 2, :]
+            right_frame = sbs_frame[:, width // 2:, :]
+
+            # Apply equidistant fisheye to both eyes
             left_fisheye = convert_to_equidistant_fisheye(left_frame, per_eye_resolution)
             right_fisheye = convert_to_equidistant_fisheye(right_frame, per_eye_resolution)
-            
-            # Combine side-by-side
-            sbs_frame = np.concatenate((left_fisheye, right_fisheye), axis=1)
+
+            # Combine into SBS frame
+            fisheye_sbs = np.concatenate((left_fisheye, right_fisheye), axis=1)
+
+            # Save frame to temp directory
             frame_path = os.path.join(temp_dir, f"{i:06d}.png")
-            cv2.imwrite(frame_path, sbs_frame)
-        
-        # Create video from frames
-        cmd = [
+            cv2.imwrite(frame_path, fisheye_sbs)
+
+            if i % 10 == 0:
+                print(f"📊 Processed {i+1}/{len(sbs_frames)} frames")
+
+        # Create video from processed frames
+        ffmpeg_cmd = [
             "ffmpeg", "-y",
             "-r", str(fps),
             "-i", os.path.join(temp_dir, "%06d.png"),
@@ -738,74 +643,22 @@ def create_side_by_side_video(
             "-crf", "18",
             "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
-            output_path
+            output_video_path
         ]
-        
-        subprocess.run(cmd, check=True)
-        print(f"✅ Created side-by-side video: {output_path}")
-        
+
+        subprocess.run(ffmpeg_cmd, check=True)
+        print(f"✅ Created fisheye video: {output_video_path}")
+
+    except Exception as e:
+        print(f"❌ Error converting frames to fisheye video: {e}")
+        raise
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
-# Alternative: Using FFmpeg's v360 filter for better performance
-def convert_video_to_equidistant_fisheye_ffmpeg(
-    input_video_path: str,
-    output_video_path: str,
-    per_eye_resolution: Tuple[int, int] = (3840, 3840)
-) -> None:
-    """
-    Convert video to fisheye using FFmpeg's v360 filter (faster and more efficient)
-    """
-    try:
-        cmd = [
-            "ffmpeg", "-i", input_video_path,
-            "-filter_complex",
-            f"[0:v]split [left][right];"
-            f"[left]crop=iw/2:ih:0:0,v360=equirect:equirect:ih_fov=180:iv_fov=180,scale={per_eye_resolution[0]}:{per_eye_resolution[1]} [left_fisheye];"
-            f"[right]crop=iw/2:ih:iw/2:0,v360=equirect:equirect:ih_fov=180:iv_fov=180,scale={per_eye_resolution[0]}:{per_eye_resolution[1]} [right_fisheye];"
-            f"[left_fisheye][right_fisheye]hstack",
-            "-c:v", "libx264",
-            "-preset", "medium",
-            "-crf", "18",
-            "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
-            "-y", output_video_path
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        if result.returncode == 0:
-            print(f"✅ Created fisheye video using FFmpeg: {output_video_path}")
-        else:
-            print(f"❌ FFmpeg fisheye conversion failed: {result.stderr}")
-            # Fall back to frame-by-frame method
-            print("🔄 Falling back to frame-by-frame conversion...")
-            convert_video_to_equidistant_fisheye(input_video_path, output_video_path, per_eye_resolution)
-            
-    except Exception as e:
-        print(f"❌ Error in FFmpeg fisheye conversion: {e}")
-        # Fall back to frame-by-frame method
-        print("🔄 Falling back to frame-by-frame conversion...")
-        convert_video_to_equidistant_fisheye(input_video_path, output_video_path, per_eye_resolution)
 
-# Usage example with asyncio
-async def process_video_async():
-    """
-    Example of how to use the conversion function with asyncio
-    """
-    temp_with_audio = "temp_video_with_audio.mp4"
-    fisheye_path = "output_fisheye_video.mp4"
-    
-    try:
-        # This will now work because we've implemented the function
-        await asyncio.to_thread(
-            convert_video_to_equidistant_fisheye_ffmpeg,  # Use FFmpeg version for better performance
-            temp_with_audio,
-            fisheye_path
-        )
-        
-        # Continue with metadata injection and other processing
-        print("✅ Fisheye conversion completed successfully")
+# Alternative: Using FFmpeg's v360 filter for better performance
+
+
         
     except Exception as e:
         print(f"❌ Error in async video processing: {e}")
@@ -1275,274 +1128,86 @@ def save_to_history(db: Session, user_id: int, original_filename: str, output_pa
 def convert_2d_to_vr180_gpu_optimized(
     input_path: str,
     output_path: str,
-    center_scale: float = 0.82,        # ← CHANGED: More comfortable central scaling
+    center_scale: float = 0.82,
     focal_length: int = 500,
-    panini_alpha: float = 0.7,         # ← CHANGED: Stronger Panini projection
-    stereographic_strength: float = 0.2,  # ← ADDED: Stereographic blend
-    eye_offset: float = 6.3,           # ← CHANGED: 63mm IPD in world units (6.3cm)
-    max_disparity_degrees: float = 1.3,   # ← ADDED: Capped disparity for comfort
-    max_blur_radius: int = 8,          # ← CHANGED: Reduced blur for clarity
+    panini_alpha: float = 0.7,
+    stereographic_strength: float = 0.2,
+    eye_offset: float = 6.3,
+    max_disparity_degrees: float = 1.3,
+    max_blur_radius: int = 8,
     ai_outpaint: bool = True,
     upscale_to_8k: bool = True,
     upscale_method: str = "lanczos",
-    expansion_degrees: int = 210       # ← ADDED: Expand to 210° before crop
+    expansion_degrees: int = 210
 ):
-    """
-    GPU-optimized 2D to VR180 conversion with hackathon-optimized parameters
-    """
-    # Add debug logging at start
     print("🎯 VR180 CONVERSION STARTED - Hackathon Optimized")
-    print(f"   Center Scale: {center_scale}, Panini: {panini_alpha}, Stereographic: {stereographic_strength}")
-    print(f"   Max Disparity: {max_disparity_degrees}°, IPD: {eye_offset}cm")
-    print(f"   FOV Expansion: {expansion_degrees}°, 8K Upscaling: {upscale_to_8k}")
-    
-    # Test video file first
+
     test_cap = cv2.VideoCapture(input_path)
     ret_test, frame_test = test_cap.read()
-    if ret_test and frame_test is not None:
-        print(f"✅ First frame OK: {frame_test.shape}")
-    else:
-        print("❌ CRITICAL: Cannot read first frame!")
+    if not (ret_test and frame_test is not None):
         test_cap.release()
         raise ValueError("Cannot read video frames")
     test_cap.release()
-    
+
     outpainting_pipe = None
     if ai_outpaint:
         try:
             outpainting_pipe = init_outpainting_model()
         except Exception as e:
-            print(f"⚠️ AI outpainting initialization failed: {e}")
+            print(f"⚠️ AI outpainting init failed: {e}")
             ai_outpaint = False
-    
+
     temp_dir = tempfile.mkdtemp()
-    
+
     try:
         cap = cv2.VideoCapture(input_path)
         if not cap.isOpened():
             raise ValueError(f"Cannot open video: {input_path}")
 
-        # Get video properties with validation
-        fps = cap.get(cv2.CAP_PROP_FPS)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        
-        if width <= 0 or height <= 0:
-            raise ValueError(f"Invalid video dimensions: {width}x{height}")
-        if total_frames <= 0:
-            raise ValueError(f"Invalid frame count: {total_frames}")
-        if fps <= 0:
-            fps = 25.0  # Default fallback
 
-        print(f"📹 Processing video: {width}x{height}, {total_frames} frames, {fps:.2f} FPS")
-        
-        if ai_outpaint and outpainting_pipe:
-            print("🎨 AI Outpainting: ENABLED")
-        else:
-            print("🎨 AI Outpainting: DISABLED")
-        
-        if upscale_to_8k:
-            print(f"🔍 8K Upscaling: ENABLED ({upscale_method})")
-        else:
-            print("🔍 8K Upscaling: DISABLED")
+        print(f"📹 Input video: {width}x{height}, {total_frames} frames at {fps:.2f} FPS")
 
-        frame_paths = []
-        prev_depths = None
         frame_batch = []
-        processed_frames = 0
-        
-        # Use appropriate batch size
-        current_batch_size = max(1, BATCH_SIZE // 2) if upscale_to_8k else BATCH_SIZE
-        print(f"📦 Using batch size: {current_batch_size}")
+        prev_depths = None
+        sbs_frames = []
 
-        # Main processing loop
+        current_batch_size = max(1, BATCH_SIZE // 2) if upscale_to_8k else BATCH_SIZE
+
         while True:
             ret, frame = cap.read()
             if not ret:
-                # Process final batch
+                # Process last batch
                 if frame_batch:
-                    print(f"🔄 Processing final batch: {len(frame_batch)} frames")
-                    
-                    try:
-                        depths = estimate_depth_batch(frame_batch)
-                        
-                        # Validate depths count
-                        if len(depths) != len(frame_batch):
-                            print(f"⚠️ Adjusting depths: {len(depths)} -> {len(frame_batch)}")
-                            while len(depths) < len(frame_batch):
-                                depths.append(np.ones((height, width), dtype=np.float32) * 0.5)
-                            depths = depths[:len(frame_batch)]
-                        
-                        if prev_depths is not None:
-                            depths = temporal_smooth_gpu(prev_depths, depths)
-                        
-                        # Process each frame with validation
-                        for i, (frame_data, depth) in enumerate(zip(frame_batch, depths)):
-                            try:
-                                print(f"🔄 Processing frame {processed_frames + i + 1}/{total_frames}")
-                                
-                                # CRITICAL: Validate frame before processing
-                                if frame_data is None:
-                                    print(f"⚠️ Skipping None frame {processed_frames + i + 1}")
-                                    continue
-                                
-                                if not isinstance(frame_data, np.ndarray):
-                                    frame_data = np.array(frame_data)
-                                
-                                frame_h, frame_w = frame_data.shape[:2]
-                                if frame_h <= 0 or frame_w <= 0:
-                                    print(f"⚠️ Skipping invalid frame: {frame_w}x{frame_h}")
-                                    continue
-                                
-                                # AI Outpainting for peripheral expansion
-                                if ai_outpaint and outpainting_pipe is not None:
-                                    try:
-                                        frame_rgb = cv2.cvtColor(frame_data, cv2.COLOR_BGR2RGB)
-                                        pil_frame = Image.fromarray(frame_rgb)
-                                        outpainted_frame = ai_outpaint_frame_vr180(
-                                            pil_frame, 
-                                            expansion_percent=25,
-                                            scene_context="hallway"
-                                        )
-                                        frame_data = cv2.cvtColor(np.array(outpainted_frame), cv2.COLOR_RGB2BGR)
-                                    except Exception as e:
-                                        print(f"⚠️ AI outpainting failed: {e}")
-                                
-                                # Apply 8K upscaling with validation
-                                if upscale_to_8k:
-                                    try:
-                                        frame_data = smart_upscale_to_8k(frame_data, upscale_method)
-                                        depth = smart_upscale_to_8k(depth, "nearest")
-                                    except Exception as e:
-                                        print(f"⚠️ Upscaling failed: {e}")
-                                        continue
-                                
-                                # Create stereo pair with hackathon-optimized parameters
-                                try:
-                                    left, right = make_stereo_pair_optimized(
-                                        frame_data, 
-                                        depth,
-                                        eye_offset=eye_offset,
-                                        center_scale=center_scale,
-                                        panini_alpha=panini_alpha,
-                                        stereographic_strength=stereographic_strength,
-                                        max_disparity_degrees=max_disparity_degrees,
-                                        max_blur_radius=max_blur_radius
-                                    )
-                                    
-                                    if left is None or right is None:
-                                        print(f"⚠️ Stereo creation returned None")
-                                        continue
-                                    
-                                    # Convert to equidistant fisheye for VR180
-                                    left_fisheye = convert_to_equidistant_fisheye(left)
-                                    right_fisheye = convert_to_equidistant_fisheye(right)
-                                    
-                                    sbs = np.concatenate((left_fisheye, right_fisheye), axis=1)
-                                    
-                                except Exception as e:
-                                    print(f"⚠️ Stereo creation failed: {e}")
-                                    continue
-                                
-                                # Save frame
-                                frame_path = os.path.join(temp_dir, f"{len(frame_paths):05d}.png")
-                                if cv2.imwrite(frame_path, sbs, [cv2.IMWRITE_PNG_COMPRESSION, 6]):
-                                    frame_paths.append(frame_path)
-                                    processed_frames += 1
-                                    
-                            except Exception as e:
-                                print(f"❌ Frame processing failed: {e}")
-                                continue
-                        
-                        clear_gpu_cache()
-                        
-                    except Exception as e:
-                        print(f"❌ Final batch failed: {e}")
-                        break
-                
-                break
-
-            # CRITICAL: Validate incoming frame
-            if frame is None:
-                print(f"⚠️ Received None frame at position {len(frame_batch)}")
-                continue
-            
-            if not isinstance(frame, np.ndarray):
-                try:
-                    frame = np.array(frame)
-                except Exception as e:
-                    print(f"⚠️ Frame conversion failed: {e}")
-                    continue
-            
-            if len(frame.shape) < 2:
-                print(f"⚠️ Invalid frame shape: {frame.shape}")
-                continue
-            
-            frame_h, frame_w = frame.shape[:2]
-            if frame_h <= 0 or frame_w <= 0:
-                print(f"⚠️ Invalid frame dimensions: {frame_w}x{frame_h}")
-                continue
-
-            # AI Outpainting for peripheral expansion
-            if ai_outpaint and outpainting_pipe is not None:
-                try:
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    pil_frame = Image.fromarray(frame_rgb)
-                    outpainted_frame = ai_outpaint_frame_vr180(
-                        pil_frame, 
-                        expansion_percent=25,
-                        scene_context="hallway"
-                    )
-                    frame = cv2.cvtColor(np.array(outpainted_frame), cv2.COLOR_RGB2BGR)
-                except Exception as e:
-                    print(f"⚠️ AI outpainting failed: {e}")
-
-            frame_batch.append(frame)
-            
-            # Process batch when full
-            if len(frame_batch) >= current_batch_size:
-                print(f"🔄 Processing batch: {len(frame_batch)} frames")
-                
-                try:
                     depths = estimate_depth_batch(frame_batch)
-                    
-                    # Validate and adjust depths
                     if len(depths) != len(frame_batch):
-                        print(f"⚠️ Adjusting depths: {len(depths)} -> {len(frame_batch)}")
                         while len(depths) < len(frame_batch):
                             depths.append(np.ones((height, width), dtype=np.float32) * 0.5)
                         depths = depths[:len(frame_batch)]
-                    
+
                     if prev_depths is not None:
                         depths = temporal_smooth_gpu(prev_depths, depths)
-                    
+
                     prev_depths = depths[-current_batch_size:]
-                    
-                    # Process batch with individual frame validation
-                    for i, (frame_data, depth) in enumerate(zip(frame_batch, depths)):
+
+                    for frame_data, depth in zip(frame_batch, depths):
                         try:
-                            # Validate frame
-                            if frame_data is None:
-                                continue
-                            
-                            frame_h, frame_w = frame_data.shape[:2]
-                            if frame_h <= 0 or frame_w <= 0:
-                                continue
-                            
-                            # Apply 8K upscaling
+                            if ai_outpaint and outpainting_pipe is not None:
+                                pil_frame = Image.fromarray(cv2.cvtColor(frame_data, cv2.COLOR_BGR2RGB))
+                                outpainted_frame = ai_outpaint_frame_vr180(
+                                    pil_frame, expansion_percent=25, scene_context="hallway"
+                                )
+                                frame_data = cv2.cvtColor(np.array(outpainted_frame), cv2.COLOR_RGB2BGR)
+
                             if upscale_to_8k:
-                                try:
-                                    frame_data = smart_upscale_to_8k(frame_data, upscale_method)
-                                    depth = smart_upscale_to_8k(depth, "nearest")
-                                except Exception as e:
-                                    print(f"⚠️ Upscaling failed: {e}")
-                                    continue
-                            
-                            # Create stereo pair with optimized parameters
+                                frame_data = smart_upscale_to_8k(frame_data, upscale_method)
+                                depth = smart_upscale_to_8k(depth, "nearest")
+
                             left, right = make_stereo_pair_optimized(
-                                frame_data, 
-                                depth,
+                                frame_data, depth,
                                 eye_offset=eye_offset,
                                 center_scale=center_scale,
                                 panini_alpha=panini_alpha,
@@ -1550,80 +1215,81 @@ def convert_2d_to_vr180_gpu_optimized(
                                 max_disparity_degrees=max_disparity_degrees,
                                 max_blur_radius=max_blur_radius
                             )
-                            
-                            # Convert to equidistant fisheye
-                            left_fisheye = convert_to_equidistant_fisheye(left)
-                            right_fisheye = convert_to_equidistant_fisheye(right)
-                            
-                            sbs = np.concatenate((left_fisheye, right_fisheye), axis=1)
-                            
-                            frame_path = os.path.join(temp_dir, f"{len(frame_paths):05d}.png")
-                            if cv2.imwrite(frame_path, sbs, [cv2.IMWRITE_PNG_COMPRESSION, 6]):
-                                frame_paths.append(frame_path)
-                                processed_frames += 1
-                                
+
+                            sbs_frames.append(np.concatenate((left, right), axis=1))
+
                         except Exception as e:
-                            print(f"❌ Frame {processed_frames + i + 1} failed: {e}")
+                            print(f"⚠️ Frame skipped: {e}")
                             continue
-                    
-                    frame_batch = []
-                    
-                    if processed_frames % (current_batch_size * 3) == 0:
-                        progress = (processed_frames / total_frames) * 100
-                        print(f"📊 Progress: {progress:.1f}% ({processed_frames}/{total_frames})")
-                        clear_gpu_cache()
-                        
-                except Exception as e:
-                    print(f"❌ Batch processing failed: {e}")
-                    frame_batch = []
-                    continue
+
+                break
+
+            frame_batch.append(frame)
+
+            if len(frame_batch) >= current_batch_size:
+                depths = estimate_depth_batch(frame_batch)
+                if len(depths) != len(frame_batch):
+                    while len(depths) < len(frame_batch):
+                        depths.append(np.ones((height, width), dtype=np.float32) * 0.5)
+                    depths = depths[:len(frame_batch)]
+
+                if prev_depths is not None:
+                    depths = temporal_smooth_gpu(prev_depths, depths)
+
+                prev_depths = depths[-current_batch_size:]
+
+                for frame_data, depth in zip(frame_batch, depths):
+                    try:
+                        if ai_outpaint and outpainting_pipe is not None:
+                            pil_frame = Image.fromarray(cv2.cvtColor(frame_data, cv2.COLOR_BGR2RGB))
+                            outpainted_frame = ai_outpaint_frame_vr180(
+                                pil_frame, expansion_percent=25, scene_context="hallway"
+                            )
+                            frame_data = cv2.cvtColor(np.array(outpainted_frame), cv2.COLOR_RGB2BGR)
+
+                        if upscale_to_8k:
+                            frame_data = smart_upscale_to_8k(frame_data, upscale_method)
+                            depth = smart_upscale_to_8k(depth, "nearest")
+
+                        left, right = make_stereo_pair_optimized(
+                            frame_data, depth,
+                            eye_offset=eye_offset,
+                            center_scale=center_scale,
+                            panini_alpha=panini_alpha,
+                            stereographic_strength=stereographic_strength,
+                            max_disparity_degrees=max_disparity_degrees,
+                            max_blur_radius=max_blur_radius
+                        )
+
+                        sbs_frames.append(np.concatenate((left, right), axis=1))
+
+                    except Exception as e:
+                        print(f"⚠️ Frame skipped: {e}")
+                        continue
+
+                frame_batch = []
+                clear_gpu_cache()
 
         cap.release()
 
-        if not frame_paths:
-            raise RuntimeError("No frames were successfully processed")
+        if not sbs_frames:
+            raise RuntimeError("No SBS frames were generated.")
 
-        print(f"✅ Processed {len(frame_paths)} frames, creating video...")
-        
-        # Create video from frames
-        try:
-            # Use software encoder for 8K
-            print("🎬 Creating 8K VR180 video with software encoder")
-            cmd = [
-                "ffmpeg", "-y",
-                "-r", str(fps),
-                "-i", os.path.join(temp_dir, "%05d.png"),
-                "-c:v", "libx264",
-                "-preset", "medium",
-                "-crf", "18",
-                "-pix_fmt", "yuv420p",
-                "-movflags", "+faststart",
-                "-threads", "0",
-                output_path
-            ]
-            
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-            
-            if result.returncode != 0:
-                print("⚠️ High quality encoding failed, trying faster preset")
-                cmd[cmd.index("-preset") + 1] = "fast"
-                cmd[cmd.index("-crf") + 1] = "23"
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-                
-            if result.returncode != 0:
-                raise RuntimeError(f"Encoding failed: {result.stderr}")
-                
-        except subprocess.TimeoutExpired:
-            raise RuntimeError("Video encoding timeout")
-        
-       
+        print(f"✅ Processed {len(sbs_frames)} frames, creating fisheye video...")
+
+        convert_sbs_frames_to_equidistant_fisheye_video(
+            sbs_frames=sbs_frames,
+            output_video_path=output_path,
+            per_eye_resolution=(3840, 3840),
+            fps=fps
+        )
+
     finally:
         if 'cap' in locals():
             cap.release()
         shutil.rmtree(temp_dir, ignore_errors=True)
         clear_gpu_cache()
-        # Create output video - adjust settings for 8K
-   
+
 # Base directories
 BASE_DIR = "/content/Vr180_Back"  # Colab base directory
 UPLOAD_DIR = os.path.join(BASE_DIR, "tmp_uploads")
@@ -1736,7 +1402,6 @@ async def convert_video(
     unique_id = uuid.uuid4().hex
     input_path = os.path.join(UPLOAD_DIR, f"input_{unique_id}.mp4")
     output_path = os.path.join(UPLOAD_DIR, f"output_{unique_id}_vr180.mp4")
-    fisheye_path = os.path.join(UPLOAD_DIR, f"fisheye_{unique_id}.mp4")  # NEW: Fisheye conversion step
     final_output_path = os.path.join(FINAL_DIR, f"vr180_{unique_id}.mp4")
     
     # Define temp_with_audio outside try block to avoid scope issues
@@ -1753,22 +1418,22 @@ async def convert_video(
         # Clear GPU memory before starting
         clear_gpu_cache()
         
-        # Step 1: Convert to VR180 using GPU optimization
+        # Step 1: Convert to VR180 using GPU optimization (INCLUDES FISHEYE)
         await asyncio.to_thread(
             convert_2d_to_vr180_gpu_optimized,
             input_path,
-            output_path,
-            center_scale=0.82,        # ← UPDATED: More comfortable
+            output_path,  # This output already has fisheye conversion
+            center_scale=0.82,
             focal_length=500,
-            panini_alpha=0.7,         # ← UPDATED: Stronger Panini
-            stereographic_strength=0.2, # ← ADDED: Stereographic blend
-            eye_offset=6.3,           # ← UPDATED: 63mm IPD
-            max_disparity_degrees=1.3, # ← ADDED: Capped disparity
-            max_blur_radius=8,        # ← UPDATED: Reduced blur
+            panini_alpha=0.7,
+            stereographic_strength=0.2,
+            eye_offset=6.3,
+            max_disparity_degrees=1.3,
+            max_blur_radius=8,
             ai_outpaint=True,
             upscale_to_8k=True,
             upscale_method="lanczos",
-            expansion_degrees=210     # ← ADDED: Expand to 210°
+            expansion_degrees=210
         )
 
         if not os.path.exists(output_path):
@@ -1777,22 +1442,14 @@ async def convert_video(
         # Step 2: Add audio with metadata preservation
         await add_audio_preserve_metadata(input_path, output_path, temp_with_audio)
         
-        # Step 3: CONVERT TO EQUIDISTANT FISHEYE (NEW STEP)
-        print("🐟 Converting to equidistant fisheye projection...")
-        await asyncio.to_thread(
-            convert_video_to_equidistant_fisheye,
-            temp_with_audio,
-            fisheye_path
-        )
-        
-        # Step 4: Inject VR180 metadata
+        # Step 3: Inject VR180 metadata (NO additional fisheye needed)
         print("📝 Injecting VR180 metadata...")
         await asyncio.to_thread(
             inject_vr180_metadata_optimized,
-            fisheye_path,           # Use fisheye-converted video
+            temp_with_audio,        # Use the audio-added version
             final_output_path,      # Final output
-            center_scale_width=7680,    # 8K width
-            center_scale_height=3840    # 8K VR180 height (2:1 ratio)
+            center_scale_width=7680,
+            center_scale_height=3840
         )
 
         if not os.path.exists(final_output_path):
@@ -1800,7 +1457,7 @@ async def convert_video(
 
         final_file_size = os.path.getsize(final_output_path)
         
-        # Step 5: Save to conversion history
+        # Step 4: Save to conversion history
         try:
             conversion = save_to_history(
                 db=db,
@@ -1814,7 +1471,7 @@ async def convert_video(
             print(f"⚠️ Database save error: {db_error}")
             conversion = None
 
-        # Step 6: Return file for download
+        # Step 5: Return file for download
         def iter_file(path: str):
             with open(path, "rb") as f:
                 while chunk := f.read(8192):
@@ -1842,36 +1499,34 @@ async def convert_video(
         raise HTTPException(status_code=500, detail=str(e))
         
     finally:
-    # Cleanup temporary files - KEEP FINAL OUTPUT
+        # Cleanup temporary files - KEEP FINAL OUTPUT
         def cleanup():
-           try:
-            # Only clean up INTERMEDIATE files, keep the final output
-              cleanup_paths = [input_path, output_path, fisheye_path]  # Intermediate files
-            
-              if 'temp_with_audio' in locals() and temp_with_audio:
-                  cleanup_paths.append(temp_with_audio)
+            try:
+                # Only clean up INTERMEDIATE files, keep the final output
+                cleanup_paths = [input_path, output_path]
+                
+                if 'temp_with_audio' in locals() and temp_with_audio:
+                    cleanup_paths.append(temp_with_audio)
 
-              for path in cleanup_paths:
-                  if os.path.exists(path) and path != final_output_path:  # ← DON'T delete final output
-                      os.unlink(path)
-                      print(f"🧹 Cleaned up temporary file: {path}")
+                for path in cleanup_paths:
+                    if os.path.exists(path) and path != final_output_path:
+                        os.unlink(path)
+                        print(f"🧹 Cleaned up temporary file: {path}")
 
-              clear_gpu_cache()
-            
-            # Log what files remain (for debugging)
-              remaining_files = []
-              for path in [input_path, output_path, fisheye_path, temp_with_audio, final_output_path]:
-                  if os.path.exists(path):
-                      remaining_files.append(path)
-            
-              print(f"📁 Files remaining after cleanup: {remaining_files}")
-            
-           except Exception as e:
-              print(f"⚠️ Cleanup error: {e}")
+                clear_gpu_cache()
+                
+                # Log what files remain (for debugging)
+                remaining_files = []
+                for path in [input_path, output_path, temp_with_audio, final_output_path]:
+                    if os.path.exists(path):
+                        remaining_files.append(path)
+                
+                print(f"📁 Files remaining after cleanup: {remaining_files}")
+                
+            except Exception as e:
+                print(f"⚠️ Cleanup error: {e}")
 
         threading.Thread(target=cleanup, daemon=True).start()
-
-
 
 @app.get("/user/conversions/")
 async def get_user_conversions(
