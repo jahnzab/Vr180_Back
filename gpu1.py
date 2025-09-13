@@ -809,7 +809,7 @@ def make_stereo_pair_optimized(
 # Utility function for batch processing
 def smart_upscale_to_8k(image, method="lanczos"):
     """
-    Proper 4x upscaling with protection against double upscaling
+    Proper 4× upscale to 3840x3840 (4K per eye) - NOT SBS!
     """
     if image is None:
         raise ValueError("Image cannot be None")
@@ -821,14 +821,10 @@ def smart_upscale_to_8k(image, method="lanczos"):
         print(f"⚠️ Already upscaled: {w}x{h}, returning as-is")
         return image
     
-    # PROPER 8K VR180 SCALING: 4x upscaling
-    scale_factor = 4  # 4x scaling for 2K→8K
+    # TARGET: 3840x3840 (4K per eye for VR180)
+    target_size = (3840, 3840)
     
-    target_w, target_h = w * scale_factor, h * scale_factor
-    
-    # For VR180, we need specific aspect ratio: 2:1 (width:height)
-    vr180_target_w = 7680
-    vr180_target_h = 3840
+    print(f"🔍 Upscaling: {w}x{h} → {target_size[0]}x{target_size[1]}")
     
     # Select interpolation method
     if method == "lanczos":
@@ -843,27 +839,14 @@ def smart_upscale_to_8k(image, method="lanczos"):
         interpolation = cv2.INTER_LINEAR
     
     try:
-        # First upscale to target dimensions
-        upscaled = cv2.resize(image, (target_w, target_h), interpolation=interpolation)
-        
-        # For VR180: Crop to 2:1 aspect ratio (center crop)
-        if target_h > vr180_target_h:
-            crop_start = (target_h - vr180_target_h) // 2
-            upscaled = upscaled[crop_start:crop_start + vr180_target_h, :]
-        
-        if target_w > vr180_target_w:
-            crop_start = (target_w - vr180_target_w) // 2
-            upscaled = upscaled[:, crop_start:crop_start + vr180_target_w]
-        
-        # Final resize to exact 8K VR180 dimensions if needed
-        if upscaled.shape[1] != vr180_target_w or upscaled.shape[0] != vr180_target_h:
-            upscaled = cv2.resize(upscaled, (vr180_target_w, vr180_target_h), interpolation=interpolation)
-        
+        # Direct 4× upscale to 3840x3840 (4K per eye)
+        upscaled = cv2.resize(image, target_size, interpolation=interpolation)
+        print(f"✅ Upscaled to: {upscaled.shape[1]}x{upscaled.shape[0]}")
         return upscaled
         
     except cv2.error as e:
         print(f"⚠️ Upscaling failed with {method}, falling back to linear: {e}")
-        upscaled = cv2.resize(image, (vr180_target_w, vr180_target_h), interpolation=cv2.INTER_LINEAR)
+        upscaled = cv2.resize(image, target_size, interpolation=cv2.INTER_LINEAR)
         return upscaled
 def create_stereo_batch_vr180(frames, depth_maps, upscale_8k=True, **kwargs):
     """
