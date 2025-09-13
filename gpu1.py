@@ -660,41 +660,42 @@ def convert_sbs_frames_to_equidistant_fisheye_video(
 
 
         
-   
+    
 def inject_vr180_metadata_optimized(
-    input_video_path: str,
-    output_video_path: str,
+    input_path: str, 
+    output_path: str,
     center_scale_width: int = 7680,
     center_scale_height: int = 3840
-) -> None:
+):
     """
-    FINAL STEP: Inject VR180 metadata into the finished video
+    Inject VR180 metadata for EQUIRECTANGULAR projection
     """
-    cmd = [
-        "ffmpeg", "-y", 
-        "-i", input_video_path,
-        "-c:v", "copy",
-        "-c:a", "copy",
-        "-movflags", "use_metadata_tags+faststart",
-        "-metadata:s:v:0", "spherical=true",
-        "-metadata:s:v:0", "stereo_mode=top_bottom",
-        "-metadata:s:v:0", "projection_type=equidistant",  # EQUIDISTANT FISHEYE
-        "-metadata:s:v:0", f"full_pano_width_pixels={center_scale_width}",
-        "-metadata:s:v:0", f"full_pano_height_pixels={center_scale_height}",
-        "-metadata:s:v:0", f"cropped_area_image_width={center_scale_width}",
-        "-metadata:s:v:0", f"cropped_area_image_height={center_scale_height}",
-        "-metadata:s:v:0", "cropped_area_left=0",
-        "-metadata:s:v:0", "cropped_area_top=0",
-        output_video_path
-    ]
-    
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    
-    if result.returncode == 0:
-        print("✅ VR180 metadata injected successfully!")
-    else:
-        print(f"❌ Metadata injection failed: {result.stderr}")
-        raise RuntimeError("VR180 metadata injection failed")            
+    try:
+        cmd = [
+            "ffmpeg", "-i", input_path,
+            "-metadata", "spherical-stereo-mode=top-bottom",
+            "-metadata", "projection-type=equirectangular",
+            "-metadata", "Spherical=true",
+            "-metadata", "StereoMode=top-bottom",
+            "-c", "copy",
+            "-y", output_path
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            print("✅ VR180 metadata injected successfully!")
+            return True
+        else:
+            print(f"❌ Metadata injection failed: {result.stderr}")
+            # Fallback: copy without metadata
+            shutil.copy2(input_path, output_path)
+            return False
+            
+    except Exception as e:
+        print(f"❌ Error in metadata injection: {e}")
+        shutil.copy2(input_path, output_path)
+        return False          
 import torch
 from diffusers import StableDiffusionInpaintPipeline
 from PIL import Image
@@ -1124,6 +1125,62 @@ def save_to_history(db: Session, user_id: int, original_filename: str, output_pa
 
     # Your conversion code here...
 # upscaling to 8k
+
+def create_side_by_side_video(
+    left_frames: List[np.ndarray],
+    right_frames: List[np.ndarray],
+    output_path: str,
+    fps: float,
+    per_eye_resolution: Tuple[int, int] = (3840, 3840)
+) -> None:
+    """
+    Create side-by-side video from left/right eye frames (EQUIRECTANGULAR output)
+    """
+    temp_dir = tempfile.mkdtemp()
+    
+    try:
+        print(f"🎬 Creating equirectangular SBS video from {len(left_frames)} frames...")
+        
+        for i, (left_frame, right_frame) in enumerate(zip(left_frames, right_frames)):
+            # Ensure both eyes have the same resolution
+            if left_frame.shape != right_frame.shape:
+                # Resize to match if needed
+                right_frame = cv2.resize(right_frame, (left_frame.shape[1], left_frame.shape[0]))
+            
+            # Combine into SBS frame
+            sbs_frame = np.concatenate((left_frame, right_frame), axis=1)
+            frame_path = os.path.join(temp_dir, f"{i:06d}.png")
+            cv2.imwrite(frame_path, sbs_frame)
+            
+            if i % 10 == 0:
+                print(f"📊 Processed {i+1}/{len(left_frames)} frames")
+
+        # Create video from frames
+        cmd = [
+            "ffmpeg", "-y",
+            "-r", str(fps),
+            "-i", os.path.join(temp_dir, "%06d.png"),
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            output_path
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            print(f"✅ Created equirectangular SBS video: {output_path}")
+        else:
+            print(f"❌ FFmpeg failed: {result.stderr}")
+            raise Exception("FFmpeg video creation failed")
+            
+    except Exception as e:
+        print(f"❌ Error creating SBS video: {e}")
+        raise
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 def convert_2d_to_vr180_gpu_optimized(
     input_path: str,
     output_path: str,
@@ -1139,7 +1196,7 @@ def convert_2d_to_vr180_gpu_optimized(
     upscale_method: str = "lanczos",
     expansion_degrees: int = 210
 ):
-    print("🎯 VR180 CONVERSION STARTED - Hackathon Optimized")
+    print("🎯 VR180 CONVERSION STARTED - Equirectangular Output")
 
     test_cap = cv2.VideoCapture(input_path)
     ret_test, frame_test = test_cap.read()
@@ -1172,7 +1229,8 @@ def convert_2d_to_vr180_gpu_optimized(
 
         frame_batch = []
         prev_depths = None
-        sbs_frames = []
+        left_eyes = []
+        right_eyes = []
 
         current_batch_size = max(1, BATCH_SIZE // 2) if upscale_to_8k else BATCH_SIZE
 
@@ -1215,10 +1273,18 @@ def convert_2d_to_vr180_gpu_optimized(
                                 max_blur_radius=max_blur_radius
                             )
 
-                            sbs_frames.append(np.concatenate((left, right), axis=1))
+                            left_eyes.append(left)
+                            right_eyes.append(right)
 
                         except Exception as e:
                             print(f"⚠️ Frame skipped: {e}")
+                            # Add fallback frames
+                            if upscale_to_8k:
+                                fallback_frame = smart_upscale_to_8k(frame_data, upscale_method)
+                            else:
+                                fallback_frame = frame_data
+                            left_eyes.append(fallback_frame)
+                            right_eyes.append(fallback_frame)
                             continue
 
                 break
@@ -1260,10 +1326,18 @@ def convert_2d_to_vr180_gpu_optimized(
                             max_blur_radius=max_blur_radius
                         )
 
-                        sbs_frames.append(np.concatenate((left, right), axis=1))
+                        left_eyes.append(left)
+                        right_eyes.append(right)
 
                     except Exception as e:
                         print(f"⚠️ Frame skipped: {e}")
+                        # Add fallback frames
+                        if upscale_to_8k:
+                            fallback_frame = smart_upscale_to_8k(frame_data, upscale_method)
+                        else:
+                            fallback_frame = frame_data
+                        left_eyes.append(fallback_frame)
+                        right_eyes.append(fallback_frame)
                         continue
 
                 frame_batch = []
@@ -1271,23 +1345,29 @@ def convert_2d_to_vr180_gpu_optimized(
 
         cap.release()
 
-        if not sbs_frames:
-            raise RuntimeError("No SBS frames were generated.")
+        if not left_eyes or not right_eyes:
+            raise RuntimeError("No stereo frames were generated.")
 
-        print(f"✅ Processed {len(sbs_frames)} frames, creating fisheye video...")
+        print(f"✅ Processed {len(left_eyes)} frames, creating EQUIRECTANGULAR SBS video...")
 
-        convert_sbs_frames_to_equidistant_fisheye_video(
-            sbs_frames=sbs_frames,
-            output_video_path=output_path,
-            per_eye_resolution=(3840, 3840),
-            fps=fps
+        # Create equirectangular SBS video (not fisheye)
+        create_side_by_side_video(
+            left_frames=left_eyes,
+            right_frames=right_eyes,
+            output_path=output_path,
+            fps=fps,
+            per_eye_resolution=(3840, 3840)  # 4K per eye for 8K total
         )
 
+    except Exception as e:
+        print(f"❌ Conversion error: {e}")
+        raise
     finally:
         if 'cap' in locals():
             cap.release()
         shutil.rmtree(temp_dir, ignore_errors=True)
         clear_gpu_cache()
+
 
 # Base directories
 BASE_DIR = "/content/Vr180_Back"  # Colab base directory
