@@ -660,8 +660,7 @@ def convert_sbs_frames_to_equidistant_fisheye_video(
 
 
         
-    except Exception as e:
-        print(f"❌ Error in async video processing: {e}")
+   
 def inject_vr180_metadata_optimized(
     input_video_path: str,
     output_video_path: str,
