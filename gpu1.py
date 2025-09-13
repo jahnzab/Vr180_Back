@@ -1337,6 +1337,9 @@ def create_video_from_frames(frame_paths, output_path, fps):
     """
     Create video from frame files using FFmpeg with resolution validation
     """
+    import subprocess  # ← ADD THIS IMPORT!
+    
+ 
     if not frame_paths:
         raise RuntimeError("No frame paths provided")
     
