@@ -556,7 +556,7 @@ import subprocess
 from typing import List, Tuple
 import numpy as np
 
-d
+
 # Alternative: Using FFmpeg's v360 filter for better performance
 
 
@@ -663,38 +663,16 @@ def ai_outpaint_batch_vr180(frames, expansion_percent=25, scene_context="hallway
         results.append(outpainted)
     
     return results    
-import cv2
-import numpy as np
-
-import cv2
-import numpy as np
-
 def make_stereo_pair_optimized(
     img, 
     depth, 
-    eye_offset=6.3,          # ← CHANGED: 63mm IPD in world units (6.3cm)
-    center_scale=0.82,       # ← CHANGED: More comfortable central scaling (from 0.85)
-    panini_alpha=0.7,        # ← CHANGED: Stronger Panini projection (from 0.6)
-    stereographic_strength=0.2,  # ← ADDED: Stereographic blend for better edges
-    max_disparity_degrees=1.3,   # ← ADDED: Capped disparity for comfort (1.3°)
-    max_blur_radius=8        # ← CHANGED: Reduced blur for better clarity (from 12)
+    eye_offset=6.3,
+    center_scale=0.82,
+    panini_alpha=0.7,
+    stereographic_strength=0.2,
+    max_disparity_degrees=1.3,
+    max_blur_radius=8
 ):
-    """
-    Creates comfortable VR180 stereo pair optimized for hackathon requirements.
-    
-    Args:
-        img: Input image (2D or 3D array)
-        depth: Depth map (same aspect ratio as img)
-        eye_offset: Interocular distance in world units (63mm = 6.3cm)
-        center_scale: Central scene scaling for comfort (0.82 recommended)
-        panini_alpha: Panini projection strength (0.7 recommended)
-        stereographic_strength: Stereographic projection blend (0.2 recommended)
-        max_disparity_degrees: Maximum visual angle disparity (1.3° for comfort)
-        max_blur_radius: Maximum blur radius for foveated effect
-    
-    Returns:
-        left, right: Stereo image pair optimized for VR180
-    """
     # Input validation
     if img is None or depth is None:
         raise ValueError("Input image and depth map cannot be None")
@@ -708,7 +686,7 @@ def make_stereo_pair_optimized(
     
     cx, cy = w // 2, h // 2
     epsilon = 1e-6
-    focal_length = 500  # Fixed focal length
+    focal_length = 500
     
     # 1. Resize depth to match frame dimensions if needed
     if depth.shape[:2] != (h, w):
@@ -726,13 +704,13 @@ def make_stereo_pair_optimized(
     y_scaled = np.clip(y_scaled, 0, h - 1)
     
     img_scaled = img[y_scaled, x_scaled]
-    depth_scaled = depth_normalized[y_scaled, x_coords]  # Keep original y for vertical alignment
+    depth_scaled = depth_normalized[y_scaled, x_coords]
 
     # 3. Calculate disparity with MAX DISPARITY CAPPING (1.3° visual angle)
-    pixel_size_mm = 0.1  # Approximate pixel size in mm (adjust based on display)
+    pixel_size_mm = 0.1
     max_pixel_disparity = (max_disparity_degrees * np.pi / 180) * focal_length / pixel_size_mm
     
-    disparity = (eye_offset * 10 * focal_length) / (depth_scaled * w)  # eye_offset in cm
+    disparity = (eye_offset * 10 * focal_length) / (depth_scaled * w)
     disparity = np.clip(disparity, -max_pixel_disparity, max_pixel_disparity).astype(np.int32)
 
     # 4. Create stereo images with depth-based shifting
@@ -749,42 +727,35 @@ def make_stereo_pair_optimized(
         left[y_coords, left_x] = img_scaled[y_coords, x_coords]
         right[y_coords, right_x] = img_scaled[y_coords, x_coords]
 
-    # 5. Apply projection blending (Panini + Stereographic)
-    def apply_projection_blending(image, focal_length, panini_alpha, stereographic_strength):
-        """Apply Panini + Stereographic projection blending for better edges."""
+    # 5. Apply SIMPLIFIED projection blending
+    def apply_simple_projection(image, strength=0.2):
+        """Simplified projection that maintains original dimensions."""
         if image is None or image.size == 0:
             return image
             
         h, w = image.shape[:2]
         cx, cy = w // 2, h // 2
         
-        # Create coordinate grids
-        y, x = np.mgrid[0:h, 0:w].astype(np.float32)
-        x -= cx
-        y -= cy
+        map_x, map_y = np.meshgrid(np.arange(w), np.arange(h))
+        map_x = map_x.astype(np.float32)
+        map_y = map_y.astype(np.float32)
         
-        # Panini projection
-        ru = np.sqrt(x**2 + focal_length**2)
-        sin_theta = x / ru
-        tan_phi_panini = y / (ru * panini_alpha + focal_length * (1 - panini_alpha))
+        x = (map_x - cx) / cx
+        y = (map_y - cy) / cy
         
-        # Stereographic projection
         r = np.sqrt(x**2 + y**2)
-        theta = np.arctan2(r, focal_length)
-        tan_phi_stereo = 2 * focal_length * np.tan(theta / 2) * y / (r + epsilon)
+        scale = 1.0 + strength * r**2
         
-        # Blend projections
-        blend_weight = np.abs(x) / (cx + epsilon)  # More stereographic at edges
-        tan_phi = (1 - blend_weight * stereographic_strength) * tan_phi_panini + blend_weight * stereographic_strength * tan_phi_stereo
+        map_x = cx + x * cx * scale
+        map_y = cy + y * cy * scale
         
-        # Map to output
-        map_x = (focal_length * sin_theta + cx)
-        map_y = (focal_length * tan_phi + cy)
+        map_x = np.clip(map_x, 0, w - 1)
+        map_y = np.clip(map_y, 0, h - 1)
         
         return cv2.remap(image, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
 
-    left = apply_projection_blending(left, focal_length, panini_alpha, stereographic_strength)
-    right = apply_projection_blending(right, focal_length, panini_alpha, stereographic_strength)
+    left = apply_simple_projection(left, strength=0.2)
+    right = apply_simple_projection(right, strength=0.2)
 
     # 6. Apply foveated blur starting at 70° eccentricity
     def apply_foveated_blur_vr180(image, start_degrees=70, max_blur_radius=8):
@@ -816,9 +787,22 @@ def make_stereo_pair_optimized(
         
         return (1 - blur_mask) * image + blur_mask * blurred
 
+    # APPLY THE BLUR
     left = apply_foveated_blur_vr180(left, start_degrees=70, max_blur_radius=max_blur_radius)
     right = apply_foveated_blur_vr180(right, start_degrees=70, max_blur_radius=max_blur_radius)
 
+    # CRITICAL: Ensure output resolution matches input
+    target_height, target_width = img.shape[:2]
+    if left.shape[0] != target_height or left.shape[1] != target_width:
+        print(f"⚠️ Correcting left eye: {left.shape} -> ({target_height}, {target_width})")
+        left = cv2.resize(left, (target_width, target_height))
+    
+    if right.shape[0] != target_height or right.shape[1] != target_width:
+        print(f"⚠️ Correcting right eye: {right.shape} -> ({target_height}, {target_width})")
+        right = cv2.resize(right, (target_width, target_height))
+    
+    print(f"✅ Final output: Left={left.shape}, Right={right.shape}")
+    
     return left.astype(np.uint8), right.astype(np.uint8)
 
 
@@ -883,7 +867,7 @@ def smart_upscale_to_8k(image, method="lanczos"):
         return upscaled
 def create_stereo_batch_vr180(frames, depth_maps, upscale_8k=True, **kwargs):
     """
-    Process batch of frames with consistent VR180 parameters and optional 8K upscaling
+    Process batch of frames with consistent VR180 parameters
     """
     left_eyes = []
     right_eyes = []
@@ -891,10 +875,10 @@ def create_stereo_batch_vr180(frames, depth_maps, upscale_8k=True, **kwargs):
     for frame, depth in zip(frames, depth_maps):
         left, right = make_stereo_pair_optimized(frame, depth, **kwargs)
         
-        # Apply 8K upscaling if requested
-        if upscale_8k:
-            left = smart_upscale_to_8k(left, method="lanczos")
-            right = smart_upscale_to_8k(right, method="lanczos")
+        # REMOVE THIS UPSCALING BLOCK - already done in make_stereo_pair_optimized!
+        # if upscale_8k:
+        #     left = smart_upscale_to_8k(left, method="lanczos")
+        #     right = smart_upscale_to_8k(right, method="lanczos")
         
         left_eyes.append(left)
         right_eyes.append(right)
@@ -903,7 +887,7 @@ def create_stereo_batch_vr180(frames, depth_maps, upscale_8k=True, **kwargs):
 
 def process_stereo_batch_safe(frames, depth_maps, upscale_8k=True, **kwargs):
     """
-    Safely process a batch of frames with 8K upscaling option
+    Safely process a batch of frames
     """
     if not frames or not depth_maps:
         return []
@@ -929,10 +913,10 @@ def process_stereo_batch_safe(frames, depth_maps, upscale_8k=True, **kwargs):
             # Create stereo pair
             left, right = make_stereo_pair_optimized(frame, depth, **kwargs)
             
-            # Apply 8K upscaling
-            if upscale_8k:
-                left = smart_upscale_to_8k(left, method="lanczos")
-                right = smart_upscale_to_8k(right, method="lanczos")
+            # REMOVE THIS UPSCALING BLOCK - already done!
+            # if upscale_8k:
+            #     left = smart_upscale_to_8k(left, method="lanczos")
+            #     right = smart_upscale_to_8k(right, method="lanczos")
             
             # Combine into side-by-side format
             sbs = np.concatenate((left, right), axis=1)
@@ -950,7 +934,6 @@ def process_stereo_batch_safe(frames, depth_maps, upscale_8k=True, **kwargs):
                 continue
     
     return stereo_pairs
-
 # AI-enhanced upscaling option (if you have access to AI models)
 def ai_enhanced_upscale_to_8k(image, model_type="esrgan"):
     """
