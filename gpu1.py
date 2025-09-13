@@ -663,63 +663,128 @@ def ai_outpaint_batch_vr180(frames, expansion_percent=25, scene_context="hallway
         results.append(outpainted)
     
     return results    
+import numpy as np
+import cv2
+
+def apply_panini_projection(image, alpha=0.7):
+    """Apply Panini projection to the image."""
+    h, w = image.shape[:2]
+    cx, cy = w // 2, h // 2
+
+    map_x, map_y = np.meshgrid(np.arange(w), np.arange(h))
+    map_x = map_x.astype(np.float32)
+    map_y = map_y.astype(np.float32)
+
+    x = (map_x - cx) / cx
+    y = (map_y - cy) / cy
+    r = np.sqrt(x**2 + y**2)
+
+    denominator = alpha + (1 - alpha) * r
+    denominator[denominator == 0] = 1e-6  # Prevent division by zero
+
+    scale = 1 / denominator
+
+    map_x = cx + x * cx * scale
+    map_y = cy + y * cy * scale
+
+    map_x = np.clip(map_x, 0, w - 1)
+    map_y = np.clip(map_y, 0, h - 1)
+
+    return cv2.remap(image, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+
+def convert_to_equidistant_fisheye(image, output_size=(3840, 3840)):
+    """Map a rectangular image to an equidistant fisheye disc in square frame."""
+    h_out, w_out = output_size
+    cx_out, cy_out = w_out // 2, h_out // 2
+    max_radius = min(cx_out, cy_out)
+
+    map_x = np.zeros((h_out, w_out), np.float32)
+    map_y = np.zeros((h_out, w_out), np.float32)
+
+    y_coords, x_coords = np.indices((h_out, w_out))
+    dx = x_coords - cx_out
+    dy = y_coords - cy_out
+    r = np.sqrt(dx**2 + dy**2)
+    theta = r / max_radius * (np.pi / 2)  # Map radial distance to theta [0, π/2]
+
+    valid_mask = r <= max_radius
+
+    phi = np.arctan2(dy, dx)
+
+    source_x = (theta * np.cos(phi) / (np.pi / 2)) * (image.shape[1] - 1)
+    source_y = (theta * np.sin(phi) / (np.pi / 2)) * (image.shape[0] - 1)
+
+    source_x = np.clip(source_x, 0, image.shape[1] - 1)
+    source_y = np.clip(source_y, 0, image.shape[0] - 1)
+
+    map_x[valid_mask] = source_x[valid_mask]
+    map_y[valid_mask] = source_y[valid_mask]
+
+    return cv2.remap(image, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+
+def apply_foveated_blur_vr180(image, start_degrees=70, max_blur_radius=8):
+    h, w = image.shape[:2]
+    cx, cy = w // 2, h // 2
+
+    y_coords, x_coords = np.indices((h, w))
+    dist_pixels = np.sqrt((x_coords - cx)**2 + (y_coords - cy)**2)
+    max_radius = np.sqrt(cx**2 + cy**2)
+    dist_degrees = (dist_pixels / max_radius) * 90  # Max 90 degrees
+
+    blur_mask = np.zeros_like(dist_degrees, dtype=np.float32)
+    mask_region = dist_degrees > start_degrees
+    if np.any(mask_region):
+        normalized_dist = (dist_degrees[mask_region] - start_degrees) / (90 - start_degrees)
+        blur_mask[mask_region] = np.clip(normalized_dist * 2, 0, 1)
+
+    blurred = cv2.GaussianBlur(image, (max_blur_radius * 2 + 1, max_blur_radius * 2 + 1), 0)
+
+    if len(image.shape) == 3:
+        blur_mask = blur_mask[:, :, np.newaxis]
+
+    return (1 - blur_mask) * image + blur_mask * blurred
+
 def make_stereo_pair_optimized(
-    img, 
-    depth, 
+    img,
+    depth,
     eye_offset=6.3,
     center_scale=0.82,
     panini_alpha=0.7,
-    stereographic_strength=0.2,
     max_disparity_degrees=1.3,
     max_blur_radius=8
 ):
-    # Input validation
-    if img is None or depth is None:
-        raise ValueError("Input image and depth map cannot be None")
-    
-    if not isinstance(img, np.ndarray) or not isinstance(depth, np.ndarray):
-        raise TypeError("Image and depth must be numpy arrays")
-    
     h, w = img.shape[:2]
-    if h <= 0 or w <= 0:
-        raise ValueError(f"Invalid image dimensions: {w}x{h}")
-    
     cx, cy = w // 2, h // 2
     epsilon = 1e-6
     focal_length = 500
-    
-    # 1. Resize depth to match frame dimensions if needed
+
     if depth.shape[:2] != (h, w):
         depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_LINEAR)
-    
-    # Normalize depth to [0.1, 1.0] range
+
     depth_normalized = (depth - depth.min()) / (depth.max() - depth.min() + epsilon)
     depth_normalized = np.clip(depth_normalized, 0.1, 1.0)
-    
-    # 2. Apply central scene scaling for comfort
+
     y_coords, x_coords = np.mgrid[0:h, 0:w]
     x_scaled = ((x_coords - cx) * center_scale + cx).astype(np.int32)
     y_scaled = ((y_coords - cy) * center_scale + cy).astype(np.int32)
     x_scaled = np.clip(x_scaled, 0, w - 1)
     y_scaled = np.clip(y_scaled, 0, h - 1)
-    
+
     img_scaled = img[y_scaled, x_scaled]
     depth_scaled = depth_normalized[y_scaled, x_coords]
 
-    # 3. Calculate disparity with MAX DISPARITY CAPPING (1.3° visual angle)
     pixel_size_mm = 0.1
     max_pixel_disparity = (max_disparity_degrees * np.pi / 180) * focal_length / pixel_size_mm
-    
+
     disparity = (eye_offset * 10 * focal_length) / (depth_scaled * w)
     disparity = np.clip(disparity, -max_pixel_disparity, max_pixel_disparity).astype(np.int32)
 
-    # 4. Create stereo images with depth-based shifting
     left = np.zeros_like(img_scaled)
     right = np.zeros_like(img_scaled)
-    
+
     left_x = np.clip(x_coords - disparity // 2, 0, w - 1)
     right_x = np.clip(x_coords + disparity // 2, 0, w - 1)
-    
+
     if len(img_scaled.shape) == 3:
         left[y_coords, left_x, :] = img_scaled[y_coords, x_coords, :]
         right[y_coords, right_x, :] = img_scaled[y_coords, x_coords, :]
@@ -727,82 +792,18 @@ def make_stereo_pair_optimized(
         left[y_coords, left_x] = img_scaled[y_coords, x_coords]
         right[y_coords, right_x] = img_scaled[y_coords, x_coords]
 
-    # 5. Apply SIMPLIFIED projection blending
-    def apply_simple_projection(image, strength=0.2):
-        """Simplified projection that maintains original dimensions."""
-        if image is None or image.size == 0:
-            return image
-            
-        h, w = image.shape[:2]
-        cx, cy = w // 2, h // 2
-        
-        map_x, map_y = np.meshgrid(np.arange(w), np.arange(h))
-        map_x = map_x.astype(np.float32)
-        map_y = map_y.astype(np.float32)
-        
-        x = (map_x - cx) / cx
-        y = (map_y - cy) / cy
-        
-        r = np.sqrt(x**2 + y**2)
-        scale = 1.0 + strength * r**2
-        
-        map_x = cx + x * cx * scale
-        map_y = cy + y * cy * scale
-        
-        map_x = np.clip(map_x, 0, w - 1)
-        map_y = np.clip(map_y, 0, h - 1)
-        
-        return cv2.remap(image, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+    # Apply proper Panini projection
+    left = apply_panini_projection(left, alpha=panini_alpha)
+    right = apply_panini_projection(right, alpha=panini_alpha)
 
-    left = apply_simple_projection(left, strength=0.2)
-    right = apply_simple_projection(right, strength=0.2)
-
-    # 6. Apply foveated blur starting at 70° eccentricity
-    def apply_foveated_blur_vr180(image, start_degrees=70, max_blur_radius=8):
-        """VR180-optimized foveated blur starting at 70° eccentricity."""
-        if image is None or image.size == 0:
-            return image
-            
-        h, w = image.shape[:2]
-        cx, cy = w // 2, h // 2
-        
-        # Calculate distance from center in degrees
-        max_radius = np.sqrt(cx**2 + cy**2)
-        y_coords, x_coords = np.indices((h, w))
-        dist_pixels = np.sqrt((x_coords - cx)**2 + (y_coords - cy)**2)
-        dist_degrees = (dist_pixels / max_radius) * 90  # Convert to degrees
-        
-        # Create blur mask (start at 70°)
-        blur_mask = np.zeros_like(dist_degrees, dtype=np.float32)
-        mask_region = dist_degrees > start_degrees
-        if np.any(mask_region):
-            normalized_dist = (dist_degrees[mask_region] - start_degrees) / (90 - start_degrees)
-            blur_mask[mask_region] = np.clip(normalized_dist * 2, 0, 1)  # Faster transition
-        
-        # Apply blur based on mask
-        blurred = cv2.GaussianBlur(image, (max_blur_radius*2+1, max_blur_radius*2+1), 0)
-        
-        if len(image.shape) == 3:
-            blur_mask = blur_mask[:, :, np.newaxis]
-        
-        return (1 - blur_mask) * image + blur_mask * blurred
-
-    # APPLY THE BLUR
+    # Apply foveated blur
     left = apply_foveated_blur_vr180(left, start_degrees=70, max_blur_radius=max_blur_radius)
     right = apply_foveated_blur_vr180(right, start_degrees=70, max_blur_radius=max_blur_radius)
 
-    # CRITICAL: Ensure output resolution matches input
-    target_height, target_width = img.shape[:2]
-    if left.shape[0] != target_height or left.shape[1] != target_width:
-        print(f"⚠️ Correcting left eye: {left.shape} -> ({target_height}, {target_width})")
-        left = cv2.resize(left, (target_width, target_height))
-    
-    if right.shape[0] != target_height or right.shape[1] != target_width:
-        print(f"⚠️ Correcting right eye: {right.shape} -> ({target_height}, {target_width})")
-        right = cv2.resize(right, (target_width, target_height))
-    
-    print(f"✅ Final output: Left={left.shape}, Right={right.shape}")
-    
+    # Convert to equidistant fisheye discs
+    left = convert_to_equidistant_fisheye(left, output_size=(3840, 3840))
+    right = convert_to_equidistant_fisheye(right, output_size=(3840, 3840))
+
     return left.astype(np.uint8), right.astype(np.uint8)
 
 
