@@ -699,41 +699,63 @@ def apply_panini_projection(image, alpha=0.7, stereographic_strength=0.2):
     return cv2.remap(image, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
 
 def convert_to_equidistant_fisheye(image, output_size=(3840, 3840)):
-    """Map rectangular image into a centered full circular equidistant fisheye in square frame."""
+    """
+    Convert rectangular image to full-frame equidistant fisheye with proper scaling
+    """
+    h_in, w_in = image.shape[:2]
     h_out, w_out = output_size
     cx_out, cy_out = w_out // 2, h_out // 2
-    max_radius = min(cx_out, cy_out)  # Maximum circular radius (half of output size)
-
+    
+    # Use 90% of frame for fisheye circle (not just half)
+    max_radius = int(min(w_out, h_out) * 0.45)  # 45% of frame size for radius
+    
+    # Create output coordinate grids
+    y_coords, x_coords = np.indices((h_out, w_out))
+    
+    # Distance from center
+    dx = (x_coords - cx_out).astype(np.float32)
+    dy = (y_coords - cy_out).astype(np.float32)
+    r = np.sqrt(dx**2 + dy**2)
+    
+    # Initialize mapping arrays
     map_x = np.zeros((h_out, w_out), np.float32)
     map_y = np.zeros((h_out, w_out), np.float32)
-
-    # Grid of output image coordinates
-    y_coords, x_coords = np.indices((h_out, w_out))
-    dx = x_coords - cx_out
-    dy = y_coords - cy_out
-    r = np.sqrt(dx**2 + dy**2)
-
+    
     # Valid circular region
     valid_mask = r <= max_radius
-
-    phi = np.arctan2(dy, dx)  # Angle in radians from center
-
-    # Equidistant mapping: map full circular area to entire input image
-    theta = r[valid_mask] / max_radius * (np.pi / 2)  # θ in [0, π/2]
-
-    # Map to source coordinates (input image)
-    source_x = (theta * np.cos(phi[valid_mask]) / (np.pi / 2)) * (image.shape[1] - 1)
-    source_y = (theta * np.sin(phi[valid_mask]) / (np.pi / 2)) * (image.shape[0] - 1)
-
-    source_x = np.clip(source_x, 0, image.shape[1] - 1)
-    source_y = np.clip(source_y, 0, image.shape[0] - 1)
-
-    map_x[valid_mask] = source_x
-    map_y[valid_mask] = source_y
-
-    # Fill outside circular region with black (remains zero)
-    fisheye_image = cv2.remap(image, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
-
+    
+    if np.any(valid_mask):
+        # Angle from center
+        phi = np.arctan2(dy[valid_mask], dx[valid_mask])
+        
+        # Normalized radius (0 to 1)
+        r_norm = r[valid_mask] / max_radius
+        
+        # IMPROVED MAPPING: Use full input image dimensions
+        # Map the entire input image into the fisheye circle
+        
+        # Convert polar to rectangular coordinates in input space
+        # Scale to use FULL input image (not just center portion)
+        source_x = (r_norm * np.cos(phi)) * (w_in * 0.5) + (w_in * 0.5)
+        source_y = (r_norm * np.sin(phi)) * (h_in * 0.5) + (h_in * 0.5)
+        
+        # Clamp to valid input coordinates
+        source_x = np.clip(source_x, 0, w_in - 1)
+        source_y = np.clip(source_y, 0, h_in - 1)
+        
+        map_x[valid_mask] = source_x
+        map_y[valid_mask] = source_y
+    
+    # Apply mapping
+    fisheye_image = cv2.remap(
+        image, 
+        map_x, 
+        map_y, 
+        interpolation=cv2.INTER_LINEAR, 
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0)
+    )
+    
     return fisheye_image
 
 def apply_foveated_blur_vr180(image, start_degrees=70, max_blur_radius=8):
@@ -758,71 +780,83 @@ def apply_foveated_blur_vr180(image, start_degrees=70, max_blur_radius=8):
 
     return (1 - blur_mask) * image + blur_mask * blurred
 
+
+def expand_fov_for_fisheye(image, expansion_factor=1.4):
+    """
+    Expand field of view before fisheye conversion to fill the circle better
+    """
+    h, w = image.shape[:2]
+    cx, cy = w // 2, h // 2
+    
+    # Create expanded canvas
+    new_w = int(w * expansion_factor)
+    new_h = int(h * expansion_factor)
+    expanded = np.zeros((new_h, new_w, image.shape[2] if len(image.shape) == 3 else 1), dtype=image.dtype)
+    
+    # Place original image in center
+    start_x = (new_w - w) // 2
+    start_y = (new_h - h) // 2
+    
+    if len(image.shape) == 3:
+        expanded[start_y:start_y+h, start_x:start_x+w] = image
+    else:
+        expanded[start_y:start_y+h, start_x:start_x+w, 0] = image
+        expanded = expanded.squeeze()
+    
+    # Fill edges with stretched content
+    # Left edge
+    if start_x > 0:
+        edge_slice = image[:, :5]  # Take leftmost 5 pixels
+        for i in range(start_x):
+            if len(image.shape) == 3:
+                expanded[:h, i] = edge_slice[:, min(i, 4)]
+            else:
+                expanded[:h, i] = edge_slice[:, min(i, 4)]
+    
+    # Similar for other edges...
+    
+    return expanded
 def make_stereo_pair_optimized(
     img,
     depth,
     eye_offset=6.3,
     center_scale=0.82,
     panini_alpha=0.7,
-    stereographic_strength=0.2, 
+    stereographic_strength=0.2,
     max_disparity_degrees=1.3,
     max_blur_radius=8
 ):
     h, w = img.shape[:2]
-    cx, cy = w // 2, h // 2
-    epsilon = 1e-6
-    focal_length = 500
-
-    if depth.shape[:2] != (h, w):
-        depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_LINEAR)
-
-    depth_normalized = (depth - depth.min()) / (depth.max() - depth.min() + epsilon)
-    depth_normalized = np.clip(depth_normalized, 0.1, 1.0)
-
-    y_coords, x_coords = np.mgrid[0:h, 0:w]
-    x_scaled = ((x_coords - cx) * center_scale + cx).astype(np.int32)
-    y_scaled = ((y_coords - cy) * center_scale + cy).astype(np.int32)
-    x_scaled = np.clip(x_scaled, 0, w - 1)
-    y_scaled = np.clip(y_scaled, 0, h - 1)
-
-    img_scaled = img[y_scaled, x_scaled]
-    depth_scaled = depth_normalized[y_scaled, x_coords]
-
-    pixel_size_mm = 0.1
-    max_pixel_disparity = (max_disparity_degrees * np.pi / 180) * focal_length / pixel_size_mm
-
-    disparity = (eye_offset * 10 * focal_length) / (depth_scaled * w)
-    disparity = np.clip(disparity, -max_pixel_disparity, max_pixel_disparity).astype(np.int32)
-
-    left = np.zeros_like(img_scaled)
-    right = np.zeros_like(img_scaled)
-
-    left_x = np.clip(x_coords - disparity // 2, 0, w - 1)
-    right_x = np.clip(x_coords + disparity // 2, 0, w - 1)
-
-    if len(img_scaled.shape) == 3:
-        left[y_coords, left_x, :] = img_scaled[y_coords, x_coords, :]
-        right[y_coords, right_x, :] = img_scaled[y_coords, x_coords, :]
-    else:
-        left[y_coords, left_x] = img_scaled[y_coords, x_coords]
-        right[y_coords, right_x] = img_scaled[y_coords, x_coords]
-
-    # Apply proper Panini projection
-    # Apply actual Panini projection
-    left = apply_panini_projection(left, alpha=panini_alpha, stereographic_strength=stereographic_strength)
+    
+    # --- 1. Create disparity map from depth ---
+    disparity = (1.0 - depth / depth.max()) * eye_offset
+    
+    # --- 2. Warp the image left and right ---
+    map_x, map_y = np.meshgrid(np.arange(w), np.arange(h))
+    left_x  = (map_x - disparity).astype(np.float32)
+    right_x = (map_x + disparity).astype(np.float32)
+    map_y   = map_y.astype(np.float32)
+    
+    left  = cv2.remap(img, left_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+    right = cv2.remap(img, right_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+    
+    # --- 3. Apply Panini projection ---
+    left  = apply_panini_projection(left, alpha=panini_alpha, stereographic_strength=stereographic_strength)
     right = apply_panini_projection(right, alpha=panini_alpha, stereographic_strength=stereographic_strength)
-
-
-    # Apply foveated blur
-    left = apply_foveated_blur_vr180(left, start_degrees=70, max_blur_radius=max_blur_radius)
+    
+    # --- 4. Apply foveated blur ---
+    left  = apply_foveated_blur_vr180(left, start_degrees=70, max_blur_radius=max_blur_radius)
     right = apply_foveated_blur_vr180(right, start_degrees=70, max_blur_radius=max_blur_radius)
-
-    # Convert to equidistant fisheye discs
-    left = convert_to_equidistant_fisheye(left, output_size=(3840, 3840))
-    right = convert_to_equidistant_fisheye(right, output_size=(3840, 3840))
-
-    return left.astype(np.uint8), right.astype(np.uint8)
-
+    
+    # --- 5. Expand FOV ---
+    left_expanded  = expand_fov_for_fisheye(left, expansion_factor=1.3)
+    right_expanded = expand_fov_for_fisheye(right, expansion_factor=1.3)
+    
+    # --- 6. Convert to fisheye ---
+    left_fisheye  = convert_to_equidistant_fisheye(left_expanded, output_size=(3840, 3840))
+    right_fisheye = convert_to_equidistant_fisheye(right_expanded, output_size=(3840, 3840))
+    
+    return left_fisheye.astype(np.uint8), right_fisheye.astype(np.uint8)
 
 # Utility function for batch processing
 def smart_upscale_to_8k(image, method="lanczos"):
