@@ -556,7 +556,7 @@ import subprocess
 from typing import List, Tuple
 import numpy as np
 
-
+d
 # Alternative: Using FFmpeg's v360 filter for better performance
 
 
@@ -825,30 +825,24 @@ def make_stereo_pair_optimized(
 # Utility function for batch processing
 def smart_upscale_to_8k(image, method="lanczos"):
     """
-    Proper 4x upscaling for 8K VR180 (from 2K to 8K, not 1K to 8K)
+    Proper 4x upscaling with protection against double upscaling
     """
     if image is None:
         raise ValueError("Image cannot be None")
     
-    if not isinstance(image, np.ndarray):
-        raise TypeError(f"Image must be numpy array, got {type(image)}")
-    
-    if len(image.shape) < 2:
-        raise ValueError(f"Image must have at least 2 dimensions, got {len(image.shape)}")
-    
     h, w = image.shape[:2]
     
-    if h <= 0 or w <= 0:
-        raise ValueError(f"Invalid image dimensions: {w}x{h}")
+    # PROTECTION: If image is already 4K or larger, don't upscale again!
+    if h >= 3840 and w >= 3840:
+        print(f"⚠️ Already upscaled: {w}x{h}, returning as-is")
+        return image
     
-    # PROPER 8K VR180 SCALING: 4x upscaling (not 8x)
-    # Input: ~1920x1080 (2K) → Output: 7680x4320 (8K UHD) → Cropped to 7680x3840 (VR180)
+    # PROPER 8K VR180 SCALING: 4x upscaling
     scale_factor = 4  # 4x scaling for 2K→8K
     
     target_w, target_h = w * scale_factor, h * scale_factor
     
     # For VR180, we need specific aspect ratio: 2:1 (width:height)
-    # So we'll upscale to 8K UHD (7680x4320) then crop to VR180 (7680x3840)
     vr180_target_w = 7680
     vr180_target_h = 3840
     
@@ -887,7 +881,6 @@ def smart_upscale_to_8k(image, method="lanczos"):
         print(f"⚠️ Upscaling failed with {method}, falling back to linear: {e}")
         upscaled = cv2.resize(image, (vr180_target_w, vr180_target_h), interpolation=cv2.INTER_LINEAR)
         return upscaled
-
 def create_stereo_batch_vr180(frames, depth_maps, upscale_8k=True, **kwargs):
     """
     Process batch of frames with consistent VR180 parameters and optional 8K upscaling
@@ -1296,11 +1289,13 @@ def process_frame_batch(
                     except Exception as e:
                         print(f"⚠️ AI outpainting failed for frame {i}: {e}")
 
-                # 8K Upscaling (optional)
+                # 8K Upscaling (optional) - ONLY ONCE
+                original_size = frame_data.shape[:2]
                 if upscale_to_8k:
                     try:
                         frame_data = smart_upscale_to_8k(frame_data, upscale_method)
                         depth = smart_upscale_to_8k(depth, "nearest")
+                        print(f"📈 Upscaled from {original_size} to {frame_data.shape[:2]}")
                     except Exception as e:
                         print(f"⚠️ Upscaling failed for frame {i}: {e}")
                         continue
@@ -1322,17 +1317,31 @@ def process_frame_batch(
                         print(f"⚠️ Stereo creation returned None for frame {i}")
                         continue
 
+                    # DEBUG: Check resolutions
+                    print(f"🔍 Frame {i}: Left={left.shape}, Right={right.shape}")
+
                 except Exception as e:
                     print(f"⚠️ Stereo creation failed for frame {i}: {e}")
                     continue
 
                 # Create side-by-side frame
                 try:
-                    # Ensure both eyes have same dimensions
+                    # Ensure both eyes have same dimensions BEFORE concatenation
                     if left.shape != right.shape:
+                        print(f"⚠️ Resizing right eye to match left: {right.shape} -> {left.shape}")
                         right = cv2.resize(right, (left.shape[1], left.shape[0]))
                     
                     sbs_frame = np.concatenate((left, right), axis=1)
+                    
+                    # DEBUG: Check final SBS resolution
+                    print(f"🎯 SBS Frame {i}: {sbs_frame.shape}")
+                    
+                    # Verify this is 7680x3840 for 8K VR180
+                    if sbs_frame.shape[1] != 7680 or sbs_frame.shape[0] != 3840:
+                        print(f"❌ WRONG RESOLUTION: {sbs_frame.shape[1]}x{sbs_frame.shape[0]} (expected 7680x3840)")
+                        # Force correct resolution
+                        sbs_frame = cv2.resize(sbs_frame, (7680, 3840))
+                        print(f"✅ Corrected to: 7680x3840")
                     
                     # Save frame
                     frame_path = os.path.join(temp_dir, f"{start_index + processed_count:06d}.png")
@@ -1360,12 +1369,31 @@ def process_frame_batch(
 
 def create_video_from_frames(frame_paths, output_path, fps):
     """
-    Create video from frame files using FFmpeg
+    Create video from frame files using FFmpeg with resolution validation
     """
     if not frame_paths:
         raise RuntimeError("No frame paths provided")
     
     temp_dir = os.path.dirname(frame_paths[0])
+    
+    # Check first frame resolution to ensure it's correct
+    first_frame = cv2.imread(frame_paths[0])
+    if first_frame is not None:
+        height, width = first_frame.shape[:2]
+        print(f"📏 First frame resolution: {width}x{height}")
+        
+        if width != 7680 or height != 3840:
+            print(f"❌ INCORRECT RESOLUTION: {width}x{height} (expected 7680x3840)")
+            print("🔄 Resizing all frames to 7680x3840...")
+            
+            # Resize all frames to correct resolution
+            for i, frame_path in enumerate(frame_paths):
+                frame = cv2.imread(frame_path)
+                if frame is not None:
+                    resized_frame = cv2.resize(frame, (7680, 3840))
+                    cv2.imwrite(frame_path, resized_frame)
+                if i % 10 == 0:
+                    print(f"📊 Resized {i+1}/{len(frame_paths)} frames")
     
     try:
         print(f"🎬 Creating video from {len(frame_paths)} frames...")
@@ -1380,7 +1408,7 @@ def create_video_from_frames(frame_paths, output_path, fps):
             "-crf", "18",
             "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
-            "-threads", "0",  # Use all available threads
+            "-threads", "0",
             output_path
         ]
         
@@ -1404,7 +1432,6 @@ def create_video_from_frames(frame_paths, output_path, fps):
                 "-preset", "ultrafast",
                 "-crf", "28",
                 "-pix_fmt", "yuv420p",
-                "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",  # Ensure even dimensions
                 output_path
             ]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
@@ -1415,14 +1442,31 @@ def create_video_from_frames(frame_paths, output_path, fps):
         if not os.path.exists(output_path):
             raise RuntimeError("Video file was not created")
             
+        # Verify final video resolution
+        try:
+            import subprocess
+            result = subprocess.run([
+                "ffprobe", "-v", "error", 
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "csv=s=x:p=0",
+                output_path
+            ], capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                resolution = result.stdout.strip()
+                print(f"✅ Final video resolution: {resolution}")
+                if resolution != "7680x3840":
+                    print(f"❌ WARNING: Wrong final resolution: {resolution}")
+        except:
+            pass
+            
         print(f"✅ Video created successfully: {output_path}")
         
     except subprocess.TimeoutExpired:
         raise RuntimeError("Video encoding timeout - file may be too large")
     except Exception as e:
         raise RuntimeError(f"Video creation failed: {str(e)}")
-
-
 # Fixed metadata injection function
 def inject_vr180_metadata_optimized(
     input_video_path: str,
