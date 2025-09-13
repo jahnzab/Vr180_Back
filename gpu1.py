@@ -666,12 +666,12 @@ def ai_outpaint_batch_vr180(frames, expansion_percent=25, scene_context="hallway
 import numpy as np
 import cv2
 
-def apply_panini_projection(image, alpha=0.7):
-    """Apply Panini projection to the image."""
+def apply_panini_projection(image, alpha=0.7, stereographic_strength=0.2):
+    """Apply Panini projection with proper alpha and stereographic strength blending."""
     h, w = image.shape[:2]
     cx, cy = w // 2, h // 2
 
-    map_x, map_y = np.meshgrid(np.arange(w), np.arange(h))
+    map_x, map_y = np.meshgrid(np.arange(w), np.arange(h), indexing='xy')
     map_x = map_x.astype(np.float32)
     map_y = map_y.astype(np.float32)
 
@@ -679,13 +679,19 @@ def apply_panini_projection(image, alpha=0.7):
     y = (map_y - cy) / cy
     r = np.sqrt(x**2 + y**2)
 
-    denominator = alpha + (1 - alpha) * r
-    denominator[denominator == 0] = 1e-6  # Prevent division by zero
+    # Proper Panini denominator formula
+    denominator = alpha + (1 - alpha) * (1 - r**2)
+    denominator = np.clip(denominator, 1e-6, None)  # Prevent division by zero
 
-    scale = 1 / denominator
+    panini_x = x / denominator
+    panini_y = y / denominator
 
-    map_x = cx + x * cx * scale
-    map_y = cy + y * cy * scale
+    # Blend with original (stereographic_strength) to control effect
+    panini_x = panini_x * (1 - stereographic_strength) + x * stereographic_strength
+    panini_y = panini_y * (1 - stereographic_strength) + y * stereographic_strength
+
+    map_x = (panini_x * cx + cx).astype(np.float32)
+    map_y = (panini_y * cy + cy).astype(np.float32)
 
     map_x = np.clip(map_x, 0, w - 1)
     map_y = np.clip(map_y, 0, h - 1)
@@ -750,6 +756,7 @@ def make_stereo_pair_optimized(
     eye_offset=6.3,
     center_scale=0.82,
     panini_alpha=0.7,
+    stereographic_strength=0.2, 
     max_disparity_degrees=1.3,
     max_blur_radius=8
 ):
@@ -793,8 +800,10 @@ def make_stereo_pair_optimized(
         right[y_coords, right_x] = img_scaled[y_coords, x_coords]
 
     # Apply proper Panini projection
-    left = apply_panini_projection(left, alpha=panini_alpha)
-    right = apply_panini_projection(right, alpha=panini_alpha)
+    # Apply actual Panini projection
+    left = apply_panini_projection(left, alpha=panini_alpha, stereographic_strength=stereographic_strength)
+    right = apply_panini_projection(right, alpha=panini_alpha, stereographic_strength=stereographic_strength)
+
 
     # Apply foveated blur
     left = apply_foveated_blur_vr180(left, start_degrees=70, max_blur_radius=max_blur_radius)
