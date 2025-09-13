@@ -698,35 +698,43 @@ def apply_panini_projection(image, alpha=0.7, stereographic_strength=0.2):
 
     return cv2.remap(image, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
 
-def convert_to_equidistant_fisheye(image, output_size=(3840, 3840)):
-    """Map a rectangular image to an equidistant fisheye disc in square frame."""
+def convert_to_equidistant_fisheye_full(image, output_size=(3840, 3840)):
+    """Map rectangular image into a centered full circular equidistant fisheye in square frame."""
     h_out, w_out = output_size
     cx_out, cy_out = w_out // 2, h_out // 2
-    max_radius = min(cx_out, cy_out)
+    max_radius = min(cx_out, cy_out)  # Maximum circular radius (half of output size)
 
     map_x = np.zeros((h_out, w_out), np.float32)
     map_y = np.zeros((h_out, w_out), np.float32)
 
+    # Grid of output image coordinates
     y_coords, x_coords = np.indices((h_out, w_out))
     dx = x_coords - cx_out
     dy = y_coords - cy_out
     r = np.sqrt(dx**2 + dy**2)
-    theta = r / max_radius * (np.pi / 2)  # Map radial distance to theta [0, π/2]
 
+    # Valid circular region
     valid_mask = r <= max_radius
 
-    phi = np.arctan2(dy, dx)
+    phi = np.arctan2(dy, dx)  # Angle in radians from center
 
-    source_x = (theta * np.cos(phi) / (np.pi / 2)) * (image.shape[1] - 1)
-    source_y = (theta * np.sin(phi) / (np.pi / 2)) * (image.shape[0] - 1)
+    # Equidistant mapping: map full circular area to entire input image
+    theta = r[valid_mask] / max_radius * (np.pi / 2)  # θ in [0, π/2]
+
+    # Map to source coordinates (input image)
+    source_x = (theta * np.cos(phi[valid_mask]) / (np.pi / 2)) * (image.shape[1] - 1)
+    source_y = (theta * np.sin(phi[valid_mask]) / (np.pi / 2)) * (image.shape[0] - 1)
 
     source_x = np.clip(source_x, 0, image.shape[1] - 1)
     source_y = np.clip(source_y, 0, image.shape[0] - 1)
 
-    map_x[valid_mask] = source_x[valid_mask]
-    map_y[valid_mask] = source_y[valid_mask]
+    map_x[valid_mask] = source_x
+    map_y[valid_mask] = source_y
 
-    return cv2.remap(image, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+    # Fill outside circular region with black (remains zero)
+    fisheye_image = cv2.remap(image, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+
+    return fisheye_image
 
 def apply_foveated_blur_vr180(image, start_degrees=70, max_blur_radius=8):
     h, w = image.shape[:2]
