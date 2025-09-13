@@ -556,7 +556,7 @@ import subprocess
 from typing import List, Tuple
 import numpy as np
 
-d
+
 # Alternative: Using FFmpeg's v360 filter for better performance
 
 
