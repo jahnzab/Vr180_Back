@@ -15,9 +15,7 @@ pydantic==2.5.0
 git+https://github.com/google/spatial-media.git
 requests
 opencv-python
-torch
-torchvision
-torchaudio
+
 numpy
 scipy
 tqdm
@@ -40,12 +38,10 @@ scikit-image
 imageio
 
 # AI & Machine Learning
-torch
-torchvision
-transformers
+
 diffusers
 accelerate
-xformers
+
 # Depth Estimation
 depth-anything-v2
 timm
