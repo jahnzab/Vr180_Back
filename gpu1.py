@@ -706,12 +706,11 @@ def blend_with_background(frame, dark_thresh=40, dilate_kernel=7, dilate_iters=2
     result = frame.copy()
     result[mask_3d > 0] = blurred_bg[mask_3d > 0]
     return result
-
-
+    
 def fast_vr180_expansion(image, center_scale=0.9, fov_expansion=2.0, side_boost=1.6, edge_push=1.3):
     """
-    VR180 Expansion with forced horizontal edge fill.
-    Expands left/right edges fully to the frame boundaries.
+    VR180 Expansion with symmetric horizontal edge fill.
+    Expands left/right edges fully to the frame boundaries, balanced per eye.
     """
     h, w = image.shape[:2]
     cache_key = f"expansion_{h}_{w}_{center_scale}_{fov_expansion}_{side_boost}_{edge_push}"
@@ -742,8 +741,8 @@ def fast_vr180_expansion(image, center_scale=0.9, fov_expansion=2.0, side_boost=
         cos_theta = np.cos(theta)
         sin_theta = np.sin(theta)
 
-        # Effective scale (boost horizontal edges more)
-        effective_scale = (horizontal_scale * np.abs(cos_theta) * (1 + edge_push * (np.abs(cos_theta))) +
+        # ✅ Symmetric effective scaling (no left/right bias)
+        effective_scale = (horizontal_scale * (1 + edge_push * (cos_theta**2)) +
                            vertical_scale * np.abs(sin_theta))
 
         # Barrel expansion curve
@@ -751,7 +750,8 @@ def fast_vr180_expansion(image, center_scale=0.9, fov_expansion=2.0, side_boost=
 
         scaled_radius = barrel_curve * (min(h, w) * effective_scale * fov_expansion * 0.45)
 
-        vertical_offset = h * 0.6
+        # Optional vertical offset
+        vertical_offset = h * 0.0
 
         # Map back to original coordinates
         original_x = original_center_x + scaled_radius * cos_theta
@@ -782,6 +782,7 @@ def fast_vr180_expansion(image, center_scale=0.9, fov_expansion=2.0, side_boost=
     blended = cv2.resize(blended, (7680, 3840))
 
     return blended
+
 
 
 def fast_panini_projection_vr180(image, d=0.7, blend_stereographic=0.2, center_scale=0.8, feather=40):
@@ -889,13 +890,13 @@ import numpy as np
 
 def fast_foveated_blur_vr180(image, center_degrees=70, max_blur_radius=8,
                              strength=1.0, center_scale=0.8,
-                             downsample=4, post_gaussian=True):
+                             downsample=4, post_gaussian=True,
+                             side_fill=True, side_width_frac=0.12):
     """
     Ultra-fast foveated blur for VR180:
     - Sharp center, blurred periphery
-    - Uses downsample + box blur for speed
-    - Optional small Gaussian cleanup for edges
-    - Fixed: fills black seams at the end
+    - Fills left/right edges with blurred background (no black cutoff)
+    - Center vision remains sharp
     """
     h, w = image.shape[:2]
     cx, cy = w // 2, h // 2
@@ -926,12 +927,26 @@ def fast_foveated_blur_vr180(image, center_degrees=70, max_blur_radius=8,
     else:
         blurred = image.copy()
 
+    # --- Left/right side fill ---
+    if side_fill:
+        side_w = int(w * side_width_frac)
+        
+        # Left strip
+        left_strip = image[:, :side_w]
+        left_blur = cv2.GaussianBlur(left_strip, (31, 31), 15)
+        blurred[:, :side_w] = left_blur
+
+        # Right strip
+        right_strip = image[:, -side_w:]
+        right_blur = cv2.GaussianBlur(right_strip, (31, 31), 15)
+        blurred[:, -side_w:] = right_blur
+
     # Blend sharp + blurred
     result = image.astype(np.float32) * (1 - blur_mask * strength) + \
              blurred.astype(np.float32) * (blur_mask * strength)
     result = result.astype(np.uint8)
 
-    # 🔹 Final black seam cleanup
+    # 🔹 Final seam cleanup
     return blend_with_background(result)
 
 def fast_fisheye_conversion(img, output_size=(3840, 3840)):
