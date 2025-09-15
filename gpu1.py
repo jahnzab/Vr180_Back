@@ -566,6 +566,9 @@ import numpy as np
 import torch
 from diffusers import StableDiffusionInpaintPipeline
 from PIL import Image
+from PIL import ImageOps, ImageFilter, ImageDraw
+
+
 import numpy as np
 import cv2
 
@@ -591,8 +594,7 @@ def init_outpainting_model():
         return None
 
 outpainting_pipe = init_outpainting_model()
-
-def ai_outpaint_frame_vr180(frame, expansion_percent=25, scene_context="hallway"):
+def ai_outpaint_frame_vr180(frame, expansion_percent=20, scene_context="hallway"):
     """
     VR180-optimized AI outpainting for peripheral expansion to 210°+
     """
@@ -665,261 +667,461 @@ def ai_outpaint_batch_vr180(frames, expansion_percent=25, scene_context="hallway
     return results    
 import numpy as np
 import cv2
+import numpy as np
+import cv2
+import cv2
+import numpy as np
 
-def improved_inpaint_occlusions(shifted_view, original_frame, disparity_map):
-    """Improved inpainting for occlusions using content-aware filling"""
-    # Mask where the remap created black (or near black) areas
+# Global cache for coordinate maps
+IMMERSIVE_CACHE = {}
+
+def optimized_inpaint_occlusions(shifted_view, original_frame, disparity_map):
+    """Fast occlusion filling without slow cv2.inpaint"""
+    # Find occlusion areas (much faster than cv2.inpaint)
     gray = cv2.cvtColor(shifted_view, cv2.COLOR_BGR2GRAY)
-    mask = (gray < 5).astype(np.uint8) * 255
-
-    if np.sum(mask) > 0:
-        # Use TELEA inpainting (fast & decent)
-        result = cv2.inpaint(shifted_view, mask, 5, cv2.INPAINT_TELEA)
-        blend_mask = (mask.astype(np.float32) / 255.0)[..., None]
-        result = result * (1 - blend_mask) + original_frame * blend_mask
+    mask = (gray < 5)
+    
+    if np.any(mask):
+        # Fast hole filling using morphological operations
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        filled = cv2.morphologyEx(shifted_view, cv2.MORPH_CLOSE, kernel)
+        
+        # Blend with original where holes exist
+        mask_3d = mask[:, :, np.newaxis]
+        result = np.where(mask_3d, filled * 0.7 + original_frame * 0.3, shifted_view)
         return result.astype(np.uint8)
+    
     return shifted_view
 
-def enhanced_vr180_expansion(image, center_scale=0.8, fov_expansion=2.5):
+def blend_with_background(frame, dark_thresh=40, dilate_kernel=7, dilate_iters=2):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    mask_dark = (gray < dark_thresh).astype(np.uint8)
+    if mask_dark.sum() == 0:
+        return frame
+    kernel = np.ones((dilate_kernel, dilate_kernel), np.uint8)
+    mask_dark = cv2.dilate(mask_dark, kernel, iterations=dilate_iters)
+    blurred_bg = cv2.resize(frame, (frame.shape[1]//8, frame.shape[0]//8))
+    blurred_bg = cv2.resize(blurred_bg, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)
+    mask_3d = np.repeat(mask_dark[:, :, np.newaxis], 3, axis=2)
+    result = frame.copy()
+    result[mask_3d > 0] = blurred_bg[mask_3d > 0]
+    return result
+
+
+def fast_vr180_expansion(image, center_scale=0.9, fov_expansion=2.0, side_boost=1.6, edge_push=1.3):
     """
-    Enhanced VR180 FOV expansion with proper peripheral content generation.
-    Uses 80% center scaling as requested.
+    VR180 Expansion with forced horizontal edge fill.
+    Expands left/right edges fully to the frame boundaries.
     """
     h, w = image.shape[:2]
+    cache_key = f"expansion_{h}_{w}_{center_scale}_{fov_expansion}_{side_boost}_{edge_push}"
     
-    # Calculate 80% center region
-    center_w = int(w * center_scale)
-    center_h = int(h * center_scale)
-    
-    # Expand horizontally for VR180 immersion
-    expanded_w = int(w * fov_expansion)
-    expanded_h = int(h * 1.2)  # Slight vertical expansion
-    
-    expanded_image = np.zeros((expanded_h, expanded_w, 3), dtype=np.uint8)
-    
-    # Place 80% of original content in center
-    start_x = (expanded_w - center_w) // 2
-    start_y = (expanded_h - center_h) // 2
-    
-    # Extract center region from original
-    orig_start_x = (w - center_w) // 2
-    orig_start_y = (h - center_h) // 2
-    
-    expanded_image[start_y:start_y + center_h, start_x:start_x + center_w] = \
-        image[orig_start_y:orig_start_y + center_h, orig_start_x:orig_start_x + center_w]
-    
-    # Fill peripherals with edge content for immersion
-    # Left peripheral
-    left_edge = image[:, :10]  # Take leftmost slice
-    left_resized = cv2.resize(left_edge, (start_x, expanded_h))
-    expanded_image[:, :start_x] = left_resized
-    
-    # Right peripheral
-    right_edge = image[:, -10:]  # Take rightmost slice
-    right_resized = cv2.resize(right_edge, (expanded_w - (start_x + center_w), expanded_h))
-    expanded_image[:, start_x + center_w:] = right_resized
-    
-    # Smooth transitions to avoid harsh edges
-    expanded_image = cv2.GaussianBlur(expanded_image, (3, 3), 0.8)
-    
-    return expanded_image
+    target_size = int(max(h, w) * 1.6)  # enlarge working space
 
-def enhanced_panini_projection_vr180(image, d=0.7, blend_stereographic=0.2, center_scale=0.8):
+    if cache_key not in IMMERSIVE_CACHE:
+        center = target_size // 2
+        original_center_x, original_center_y = w // 2, h // 2
+
+        # Create coordinate grids
+        y_lin = np.linspace(0, target_size - 1, target_size, dtype=np.float32)
+        x_lin = np.linspace(0, target_size - 1, target_size, dtype=np.float32)
+        x_coords, y_coords = np.meshgrid(x_lin, y_lin)
+
+        dx = x_coords - center
+        dy = y_coords - center
+        distance = np.sqrt(dx**2 + dy**2)
+        theta = np.arctan2(dy, dx)
+
+        max_radius = center * 0.95
+        normalized_dist = np.clip(distance / max_radius, 0, 1)
+
+        # Separate scaling
+        horizontal_scale = center_scale * side_boost
+        vertical_scale   = center_scale * 1.1
+
+        cos_theta = np.cos(theta)
+        sin_theta = np.sin(theta)
+
+        # Effective scale (boost horizontal edges more)
+        effective_scale = (horizontal_scale * np.abs(cos_theta) * (1 + edge_push * (np.abs(cos_theta))) +
+                           vertical_scale * np.abs(sin_theta))
+
+        # Barrel expansion curve
+        barrel_curve = normalized_dist ** 1.3
+
+        scaled_radius = barrel_curve * (min(h, w) * effective_scale * fov_expansion * 0.45)
+
+        vertical_offset = h * 0.6
+
+        # Map back to original coordinates
+        original_x = original_center_x + scaled_radius * cos_theta
+        original_y = original_center_y + scaled_radius * sin_theta - vertical_offset
+
+        original_x = np.clip(original_x, 0, w - 1)
+        original_y = np.clip(original_y, 0, h - 1)
+
+        IMMERSIVE_CACHE[cache_key] = (original_x, original_y, target_size)
+
+    original_x, original_y, target_size = IMMERSIVE_CACHE[cache_key]
+
+    expanded = cv2.remap(
+        image, original_x, original_y,
+        cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP
+    )
+
+    # 🔹 Soft edge blending
+    blurred = cv2.GaussianBlur(expanded, (0, 0), sigmaX=25, sigmaY=25)
+    mask = cv2.cvtColor(expanded, cv2.COLOR_BGR2GRAY)
+    mask = cv2.normalize(mask, None, 0, 1.0, cv2.NORM_MINMAX)
+    mask = cv2.merge([mask, mask, mask])
+
+    blended = (expanded.astype(np.float32) * mask +
+               blurred.astype(np.float32) * (1 - mask)).astype(np.uint8)
+
+    # 🔹 Force final VR180 size
+    blended = cv2.resize(blended, (7680, 3840))
+
+    return blended
+
+
+def fast_panini_projection_vr180(image, d=0.7, blend_stereographic=0.2, center_scale=0.8, feather=40):
     """
-    Enhanced Panini projection for VR180 with 80% center scaling.
-    Based on the reference implementation with proper remap handling.
+    Optimized Panini projection with built-in mask feathering to remove black hex edges
     """
     h, w = image.shape[:2]
-    
-    # Build normalized coordinate grids centered at 0
-    ys = np.linspace(-1.0, 1.0, h).astype(np.float32)
-    xs = np.linspace(-1.0, 1.0, w).astype(np.float32)
-    x_n, y_n = np.meshgrid(xs, ys)
-    
-    # Avoid division by zero
-    eps = 1e-9
-    d = max(1e-3, float(d))
-    
-    # Panini mapping (vectorized)
-    atan_xn_d = np.arctan(x_n / d)
-    cos_ax = np.cos(atan_xn_d)
-    sin_ax = np.sin(atan_xn_d)
-    denom = cos_ax + (y_n * sin_ax) / d
-    denom = np.where(np.abs(denom) < eps, eps, denom)
-    y_p = y_n / denom
-    x_p = x_n.copy()
-    
-    # Apply 80% center scaling
-    center_factor = center_scale
-    x_p *= center_factor
-    y_p *= center_factor
-    
-    # Stereographic blend for smoother edges
-    if blend_stereographic > 0:
-        r = np.sqrt(x_n**2 + y_n**2)
-        theta = np.arctan2(y_n, x_n)
-        r_s = 2.0 * np.tan(r / 2.0 + eps)
-        x_s = r_s * np.cos(theta) * center_factor
-        y_s = r_s * np.sin(theta) * center_factor
-        x_p = (1 - blend_stereographic) * x_p + blend_stereographic * x_s
-        y_p = (1 - blend_stereographic) * y_p + blend_stereographic * y_s
-    
-    # Convert projected coords back to pixel coordinates
-    map_x = ((x_p + 1.0) * (w - 1) / 2.0).astype(np.float32)
-    map_y = ((y_p + 1.0) * (h - 1) / 2.0).astype(np.float32)
-    
-    # Apply remap with proper border handling
-    remapped = cv2.remap(image, map_x, map_y, 
-                        interpolation=cv2.INTER_LINEAR,
-                        borderMode=cv2.BORDER_REPLICATE)
-    
-    # Gentle smoothing for VR180
-    remapped = cv2.GaussianBlur(remapped, (3, 3), 0.8)
-    remapped = cv2.edgePreservingFilter(remapped, flags=1, sigma_s=10, sigma_r=0.15)
-    
-    return remapped
+    cache_key = f"panini_{h}_{w}_{d}_{blend_stereographic}_{center_scale}"
 
-def generate_vr180_stereo_pair(frame, depth_map, ipd=63, disparity_cap=1.3):
+    if cache_key not in IMMERSIVE_CACHE:
+        ys = np.linspace(-1.0, 1.0, h, dtype=np.float32)
+        xs = np.linspace(-1.0, 1.0, w, dtype=np.float32)
+        x_n, y_n = np.meshgrid(xs, ys)
+
+        d = max(0.1, float(d))
+        atan_x = np.arctan(x_n / d)
+        cos_atan = np.cos(atan_x)
+        sin_atan = np.sin(atan_x)
+
+        denom = cos_atan + (y_n * sin_atan) / d
+        denom = np.where(np.abs(denom) < 1e-6, 1e-6, denom)
+
+        x_p = x_n * center_scale
+        y_p = (y_n / denom) * center_scale
+
+        if blend_stereographic > 0:
+            r = np.sqrt(x_n**2 + y_n**2)
+            blend_factor = np.tanh(r) * blend_stereographic
+            x_p = x_p * (1 - blend_factor) + x_n * center_scale * blend_factor
+            y_p = y_p * (1 - blend_factor) + y_n * center_scale * blend_factor
+
+        map_x = ((x_p + 1.0) * (w - 1) / 2.0).astype(np.float32)
+        map_y = ((y_p + 1.0) * (h - 1) / 2.0).astype(np.float32)
+
+        IMMERSIVE_CACHE[cache_key] = (map_x, map_y)
+
+    map_x, map_y = IMMERSIVE_CACHE[cache_key]
+
+    # Project with BORDER_CONSTANT (black will appear)
+    projected = cv2.remap(
+    image, map_x, map_y,
+    cv2.INTER_LINEAR,
+    borderMode=cv2.BORDER_REPLICATE
+    )
+
+
+    # ---- NEW: create valid mask ----
+    valid_mask = cv2.remap(np.ones((h, w), np.float32), map_x, map_y, cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    valid_mask = cv2.GaussianBlur(valid_mask, (0, 0), sigmaX=feather, sigmaY=feather)
+
+    mask_3d = np.repeat(valid_mask[:, :, np.newaxis], 3, axis=2)
+
+    # Create blurred background filler
+    blurred_bg = cv2.resize(image, (w // 8, h // 8))
+    blurred_bg = cv2.resize(blurred_bg, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    # Blend Panini projection with blurred filler where mask fades out
+    blended = (projected.astype(np.float32) * mask_3d +
+               blurred_bg.astype(np.float32) * (1 - mask_3d))
+
+    return blended.astype(np.uint8)
+
+
+
+    
+def fast_stereo_generation(frame, depth_map, ipd=63, disparity_cap=1.3):
     """
-    Generate VR180 stereo pair with proper disparity mapping and occlusion handling.
-    Based on reference implementation but optimized for VR180.
+    Optimized stereo generation - now with background blending to remove black edges.
     """
+    # 🔹 NEW: Fix black gaps before stereo
+    frame = blend_with_background(frame)
+
     h, w = frame.shape[:2]
-    
-    # Compute subpixel disparity as float map
-    max_disparity = (w * (disparity_cap / 90.0))  # VR180 specific scaling
-    disparity_map = depth_map * max_disparity
-    
-    # Build remap coordinate grids
-    y_coords = np.arange(h).astype(np.float32)
-    x_coords = np.arange(w).astype(np.float32)
-    map_x, map_y = np.meshgrid(x_coords, y_coords)
-    
-    # Create stereo views with horizontal disparity shifts
-    # Right view: sample from x - disparity
-    map_x_right = (map_x - disparity_map).astype(np.float32)
-    map_y_right = map_y.astype(np.float32)
-    
-    # Left view: sample from x + disparity
-    map_x_left = (map_x + disparity_map).astype(np.float32)
-    map_y_left = map_y.astype(np.float32)
-    
-    # Apply remap with border replication
-    left_view = cv2.remap(frame, map_x_left, map_y_left, 
-                         interpolation=cv2.INTER_LINEAR,
-                         borderMode=cv2.BORDER_REPLICATE)
-    right_view = cv2.remap(frame, map_x_right, map_y_right, 
-                          interpolation=cv2.INTER_LINEAR,
-                          borderMode=cv2.BORDER_REPLICATE)
-    
-    # Inpaint occlusions
-    left_view = improved_inpaint_occlusions(left_view, frame, disparity_map)
-    right_view = improved_inpaint_occlusions(right_view, frame, -disparity_map)
-    
-    return left_view, right_view
 
-def apply_vr180_foveated_blur(image, center_degrees=60, max_blur_radius=8, center_scale=0.8):
+    # Vectorized disparity calculation
+    max_disparity = min(w * (disparity_cap / 90.0), 40)  # Cap for safety
+    disparity_map = depth_map * max_disparity
+
+    # Fast integer disparity for array indexing
+    disparity_int = np.round(disparity_map).astype(np.int32)
+
+    # Initialize output arrays
+    left_view = np.zeros_like(frame)
+    right_view = np.zeros_like(frame)
+
+    # Vectorized stereo shift using advanced indexing
+    y_indices = np.arange(h)[:, np.newaxis]
+    x_indices = np.arange(w)[np.newaxis, :]
+
+    # Left view: shift left
+    x_left = np.clip(x_indices + disparity_int, 0, w - 1)
+    left_view[y_indices, x_indices] = frame[y_indices, x_left]
+
+    # Right view: shift right  
+    x_right = np.clip(x_indices - disparity_int, 0, w - 1)
+    right_view[y_indices, x_indices] = frame[y_indices, x_right]
+
+    # Fast hole filling
+    left_view = optimized_inpaint_occlusions(left_view, frame, disparity_map)
+    right_view = optimized_inpaint_occlusions(right_view, frame, -disparity_map)
+
+    return left_view, right_view
+import cv2
+import numpy as np
+
+def fast_foveated_blur_vr180(image, center_degrees=70, max_blur_radius=8,
+                             strength=1.0, center_scale=0.8,
+                             downsample=4, post_gaussian=True):
     """
-    Apply foveated blur for VR180 with 80% center focus.
+    Ultra-fast foveated blur for VR180:
+    - Sharp center, blurred periphery
+    - Uses downsample + box blur for speed
+    - Optional small Gaussian cleanup for edges
+    - Fixed: fills black seams at the end
     """
     h, w = image.shape[:2]
     cx, cy = w // 2, h // 2
+
+    # Distance grid
+    y_coords = np.arange(h, dtype=np.float32)[:, np.newaxis] - cy
+    x_coords = np.arange(w, dtype=np.float32)[np.newaxis, :] - cx
+    dist_pixels = np.sqrt(x_coords**2 + y_coords**2)
+
+    # Normalize to angular FOV
+    max_radius = np.sqrt(cx**2 + cy**2) * center_scale
+    max_angle = np.arctan(np.max(dist_pixels) / max_radius) * (180 / np.pi)
+    angular_distance = (np.arctan(dist_pixels / max_radius) * (180 / np.pi)) / max_angle * 90
+
+    # Blur mask
+    blur_mask = np.clip((angular_distance - center_degrees) / (90 - center_degrees), 0, 1) ** 1.2
+    if image.ndim == 3:
+        blur_mask = blur_mask[:, :, np.newaxis]
+
+    # --- Fast blur ---
+    if max_blur_radius > 0:
+        small = cv2.resize(image, (w // downsample, h // downsample), interpolation=cv2.INTER_LINEAR)
+        k = max(1, max_blur_radius // downsample)
+        blurred_small = cv2.blur(small, (k, k))
+        blurred = cv2.resize(blurred_small, (w, h), interpolation=cv2.INTER_LINEAR)
+        if post_gaussian:
+            blurred = cv2.GaussianBlur(blurred, (3, 3), 0)
+    else:
+        blurred = image.copy()
+
+    # Blend sharp + blurred
+    result = image.astype(np.float32) * (1 - blur_mask * strength) + \
+             blurred.astype(np.float32) * (blur_mask * strength)
+    result = result.astype(np.uint8)
+
+    # 🔹 Final black seam cleanup
+    return blend_with_background(result)
+
+def fast_fisheye_conversion(img, output_size=(3840, 3840)):
+    """
+    Fixed fisheye conversion - eliminates black holes with edge blending + background fill
+    """
+    h_in, w_in = img.shape[:2]
+    h_out, w_out = output_size
+    cache_key = f"fisheye_{h_in}_{w_in}_{h_out}_{w_out}"
     
-    # Create distance map
-    y_coords, x_coords = np.indices((h, w))
-    dx = (x_coords - cx).astype(np.float32)
-    dy = (y_coords - cy).astype(np.float32)
-    dist_pixels = np.sqrt(dx**2 + dy**2)
+    if cache_key not in IMMERSIVE_CACHE:
+        cx_out, cy_out = w_out // 2, h_out // 2
+        max_radius = min(h_out, w_out) // 2
+        
+        y_out = np.arange(h_out, dtype=np.float32)[:, np.newaxis] - cy_out
+        x_out = np.arange(w_out, dtype=np.float32)[np.newaxis, :] - cx_out
+        r = np.sqrt(x_out**2 + y_out**2)
+        theta = np.arctan2(y_out, x_out)
+        
+        phi = (r / max_radius) * (np.pi / 2)
+        rectilinear_r = np.tan(phi) * (min(w_in, h_in) / 3)
+        
+        source_x = (w_in / 2) + rectilinear_r * np.cos(theta) * 0.8
+        source_y = (h_in / 2) + rectilinear_r * np.sin(theta) * 0.8
+        
+        source_x = source_x.astype(np.float32)
+        source_y = source_y.astype(np.float32)
+        
+        valid_region = r <= max_radius
+        edge_blend = np.clip((max_radius - r) / (max_radius * 0.05), 0, 1)
+        
+        IMMERSIVE_CACHE[cache_key] = (source_x, source_y, valid_region, edge_blend)
     
-    # Convert to angular distance
-    max_radius = np.sqrt(cx**2 + cy**2)
-    angular_distance = np.arctan2(dist_pixels, max_radius * center_scale) * (180 / np.pi)
+    source_x, source_y, valid_region, edge_blend = IMMERSIVE_CACHE[cache_key]
+    fisheye = cv2.remap(img, source_x, source_y, cv2.INTER_LINEAR, cv2.BORDER_REPLICATE)
     
-    # Create progressive blur mask
-    blur_mask = np.zeros_like(angular_distance, dtype=np.float32)
-    blur_region = angular_distance > center_degrees
+    if len(img.shape) == 3:
+        edge_blend_3d = edge_blend[:, :, np.newaxis]
+    else:
+        edge_blend_3d = edge_blend
     
-    if np.any(blur_region):
-        normalized_dist = (angular_distance[blur_region] - center_degrees) / (90 - center_degrees)
-        blur_intensity = np.clip(normalized_dist ** 1.2, 0, 1)
-        blur_mask[blur_region] = blur_intensity
+    center_color = img[h_in//2, w_in//2]
+    if len(img.shape) == 3:
+        center_color = center_color.reshape(1, 1, 3)
     
-    # Apply progressive blur
-    result = image.astype(np.float32)
-    for radius in [2, 4, 6, max_blur_radius]:
-        kernel_size = radius * 2 + 1
-        blurred = cv2.GaussianBlur(image, (kernel_size, kernel_size), 0)
-        level_mask = np.clip(blur_mask * (radius / max_blur_radius), 0, 1)
-        if len(image.shape) == 3:
-            level_mask = level_mask[:, :, np.newaxis]
-        blend_factor = level_mask * 0.3  # Gentle blending
-        result = result * (1 - blend_factor) + blurred.astype(np.float32) * blend_factor
+    result = np.where(valid_region[:, :, np.newaxis] if len(img.shape) == 3 else valid_region,
+                     fisheye,
+                     fisheye * edge_blend_3d + center_color * (1 - edge_blend_3d))
     
-    return result.astype(np.uint8)
+    if len(img.shape) == 3:
+        zero_mask = np.all(result == 0, axis=2)
+        if np.any(zero_mask):
+            result[zero_mask] = center_color[0, 0]
+    else:
+        zero_mask = result == 0
+        if np.any(zero_mask):
+            result[zero_mask] = center_color
+    
+    # 🔹 Final black seam cleanup
+    return blend_with_background(result.astype(np.uint8))
+   
+    
+    # Create mask - only outpaint the expanded areas
+    mask = Image.new("L", (new_width, new_height), 255)  # White = keep
+    
+    # Black mask where we want to outpaint (the expanded border areas)
+    draw_mask = Image.new("L", (width, height), 0)  # Black = inpaint
+    mask.paste(draw_mask, (expand_left_right, expand_top))
+    
+    # VR180-SPECIFIC PROMPT with scene context
+    scene_prompts = {
+        "hallway": "architectural hallway extension, continuous corridor, symmetric architecture, clean lines, realistic building interior, seamless extension",
+        "outdoor": "natural environment extension, outdoor scenery continuation, realistic landscape, seamless terrain, consistent lighting",
+        "general": "VR180 peripheral expansion, seamless environment extension, consistent perspective, natural continuation, immersive VR experience"
+    }
+    
+    prompt = scene_prompts.get(scene_context, scene_prompts["general"])
+    negative_prompt = "blurry, distorted, inconsistent, discontinuous, mismatched, artificial, fake, low quality"
+    
+    # Optimized outpainting parameters for VR
+    result = outpainting_pipe(
+        prompt=prompt,
+        image=expanded_canvas,
+        mask_image=mask,
+        strength=0.85,  # Slightly lower for better consistency
+        guidance_scale=8.0,
+        num_inference_steps=25,
+        negative_prompt=negative_prompt,
+        generator=torch.Generator(device=outpainting_pipe.device).manual_seed(42)  # For consistency
+    ).images[0]
+    
+    # For VR180: Return the fully expanded image (210°+)
+    # The conversion to 180° will happen later in the pipeline
+    return result
+
 
 def make_stereo_pair_optimized(
-    img,
-    depth,
+    img, depth,
     eye_offset=6.3,
-    center_scale=0.8,  # 80% center scaling as requested
-    panini_d=0.7,
+    center_scale=0.8,
+    panini_alpha=0.7,
     stereographic_strength=0.2,
     max_disparity_degrees=1.3,
     max_blur_radius=12,
-    expansion_factor=2.5,
+    expansion_factor=2.2,
     output_size=(3840, 3840),
     blur_center_degrees=60,
     enable_foveated_blur=True
 ):
-    """
-    Optimized VR180 stereo pair creation with 80% center scaling.
-    Removes fisheye approach, uses proper remap-based processing.
-    AI outpainting handled separately in main conversion pipeline.
-    """
-    h, w = img.shape[:2]
-    print(f"Input image shape: {img.shape}")
-    
-    # --- 1. VR180 FOV expansion with 80% center scaling ---
-    img_expanded = enhanced_vr180_expansion_fallback(img, center_scale=center_scale, 
-                                                   fov_expansion=expansion_factor)
-    print(f"Expanded image shape: {img_expanded.shape}")
-    
-    # --- 2. Apply enhanced Panini projection for VR180 ---
-    img_projected = enhanced_panini_projection_vr180(img_expanded, d=panini_d, 
-                                                    blend_stereographic=stereographic_strength,
-                                                    center_scale=center_scale)
-    print(f"Panini projected shape: {img_projected.shape}")
-    
-    # --- 3. Normalize depth map ---
-    depth_normalized = (depth - depth.min()) / (depth.max() - depth.min() + 1e-6)
-    
-    # Resize depth to match projected image if needed
-    if depth_normalized.shape != img_projected.shape[:2]:
-        depth_normalized = cv2.resize(depth_normalized, (img_projected.shape[1], img_projected.shape[0]))
-    
-    # --- 4. Generate stereo pair using reference method ---
-    # Convert eye_offset to IPD in mm
-    ipd_mm = eye_offset * 10  # Convert cm to mm
-    left_view, right_view = generate_vr180_stereo_pair(img_projected, depth_normalized, 
-                                                      ipd=ipd_mm, disparity_cap=max_disparity_degrees)
-    print(f"Stereo pair generated: Left={left_view.shape}, Right={right_view.shape}")
-    
-    # --- 5. Apply foveated blur if enabled ---
-    if enable_foveated_blur:
-        left_view = apply_vr180_foveated_blur(left_view, center_degrees=blur_center_degrees, 
-                                            max_blur_radius=max_blur_radius, center_scale=center_scale)
-        right_view = apply_vr180_foveated_blur(right_view, center_degrees=blur_center_degrees, 
-                                             max_blur_radius=max_blur_radius, center_scale=center_scale)
-        print("Foveated blur applied")
-    
-    # --- 6. Resize to target output size ---
-    if output_size and (left_view.shape[1] != output_size[0] or left_view.shape[0] != output_size[1]):
-        left_view = cv2.resize(left_view, output_size, interpolation=cv2.INTER_LANCZOS4)
-        right_view = cv2.resize(right_view, output_size, interpolation=cv2.INTER_LANCZOS4)
-        print(f"Resized to target: {output_size}")
-    
-    print(f"Final stereo pair: Left={left_view.shape}, Right={right_view.shape}")
-    return left_view, right_view    
+    # 1. Generate background
+    img_expanded = fast_vr180_expansion(img, center_scale=center_scale, fov_expansion=expansion_factor)
+    img_projected = fast_panini_projection_vr180(img_expanded, d=panini_alpha,
+                                                 blend_stereographic=stereographic_strength,
+                                                 center_scale=center_scale)
+
+    if depth.shape != img_projected.shape[:2]:
+        depth_normalized = cv2.resize(depth, (img_projected.shape[1], img_projected.shape[0]))
+    else:
+        depth_normalized = depth.copy()
+
+    depth_normalized = (depth_normalized - depth_normalized.min()) / (
+        depth_normalized.max() - depth_normalized.min() + 1e-6
+    )
+
+    ipd_mm = eye_offset * 10
+    left_bg, right_bg = fast_stereo_generation(img_projected, depth_normalized,
+                                               ipd=ipd_mm, disparity_cap=max_disparity_degrees)
+
+    # Force correct size
+    left_bg = cv2.resize(left_bg, output_size)
+    right_bg = cv2.resize(right_bg, output_size)
+
+    # Optional foveated blur
+    if enable_foveated_blur and max_blur_radius > 0:
+        left_bg = fast_foveated_blur_vr180(left_bg,
+                                           center_degrees=blur_center_degrees,
+                                           max_blur_radius=max_blur_radius,
+                                           center_scale=center_scale)
+        right_bg = fast_foveated_blur_vr180(right_bg,
+                                            center_degrees=blur_center_degrees,
+                                            max_blur_radius=max_blur_radius,
+                                            center_scale=center_scale)
+
+    # 2. Generate circular sharp fisheye (center immersive view)
+    center_left = fast_fisheye_conversion(img, output_size=output_size)
+    center_right = fast_fisheye_conversion(img, output_size=output_size)
+
+    # Apply sharpening
+    sharpening_kernel = np.array([[0, -1, 0],
+                                  [-1, 5, -1],
+                                  [0, -1, 0]])
+    center_left = cv2.filter2D(center_left, -1, sharpening_kernel)
+    center_right = cv2.filter2D(center_right, -1, sharpening_kernel)
+
+    # 3. Composite center onto background with smooth alpha blending
+    def composite_center_vr180_immersive(bg, center, center_scale=0.8, transition_width=300):
+      """
+      Clean compositing without hexagonal artifacts
+      """
+      h, w = bg.shape[:2]
+      cx, cy = w // 2, h // 2
+
+      # Simple radial blending - no morphological operations
+      y_coords, x_coords = np.indices((h, w))
+      dx = (x_coords - cx) / (w * center_scale / 2)
+      dy = (y_coords - cy) / (h * center_scale / 2)
+      dist = np.sqrt(dx**2 + dy**2)
+
+      # Smooth cosine transition
+      blend_mask = 0.5 * (1 + np.cos(np.pi * np.clip(dist - 0.8, 0, 1)))
+      blend_mask = cv2.GaussianBlur(blend_mask, (0, 0), sigmaX=20)
+
+      if bg.ndim == 3:
+        blend_mask = blend_mask[:, :, np.newaxis]
+
+      result = center.astype(np.float32) * blend_mask + bg.astype(np.float32) * (1 - blend_mask)
+      return result.astype(np.uint8)
+
+
+    # ✅ actually call the composite function
+    left_final = composite_center_vr180_immersive(left_bg, center_left, center_scale=center_scale)
+    right_final = composite_center_vr180_immersive(right_bg, center_right, center_scale=center_scale)
+
+    return left_final, right_final
+
+def clear_immersive_cache():
+    """Clear cache to free memory if needed"""
+    global IMMERSIVE_CACHE
+    IMMERSIVE_CACHE.clear()
+    print("Immersive VR180 cache cleared")
 
 # Utility function for batch processing
 def smart_upscale_to_8k(image, method="lanczos"):
@@ -1125,7 +1327,7 @@ def create_side_by_side_video(
 def convert_2d_to_vr180_gpu_optimized(
     input_path: str,
     output_path: str,
-    center_scale: float = 0.82,
+    center_scale: float = 0.8,
     focal_length: int = 500,
     panini_alpha: float = 0.7,
     stereographic_strength: float = 0.2,
@@ -1320,19 +1522,16 @@ def process_frame_batch(
         return 0
     
     try:
-        # Get depth maps for the batch
+        # --- STEP 1: Depth estimation (original resolution) ---
         depths = estimate_depth_batch(frame_batch)
         
-        # Ensure depths match frame count
         if len(depths) != len(frame_batch):
             print(f"⚠️ Adjusting depths: {len(depths)} -> {len(frame_batch)}")
             while len(depths) < len(frame_batch):
-                # Create fallback depth map
                 h, w = frame_batch[0].shape[:2]
                 depths.append(np.ones((h, w), dtype=np.float32) * 0.5)
             depths = depths[:len(frame_batch)]
 
-        # Apply temporal smoothing if we have previous depths
         if prev_depths is not None:
             try:
                 depths = temporal_smooth_gpu(prev_depths, depths)
@@ -1343,7 +1542,6 @@ def process_frame_batch(
         
         for i, (frame_data, depth) in enumerate(zip(frame_batch, depths)):
             try:
-                # Validate frame and depth
                 if frame_data is None or depth is None:
                     print(f"⚠️ Skipping None frame/depth at index {i}")
                     continue
@@ -1356,32 +1554,7 @@ def process_frame_batch(
                     print(f"⚠️ Skipping invalid frame dimensions: {frame_w}x{frame_h}")
                     continue
 
-                # AI Outpainting (optional)
-                if outpainting_pipe is not None:
-                    try:
-                        frame_rgb = cv2.cvtColor(frame_data, cv2.COLOR_BGR2RGB)
-                        pil_frame = Image.fromarray(frame_rgb)
-                        outpainted_frame = ai_outpaint_frame_vr180(
-                            pil_frame, 
-                            expansion_percent=25, 
-                            scene_context="hallway"
-                        )
-                        frame_data = cv2.cvtColor(np.array(outpainted_frame), cv2.COLOR_RGB2BGR)
-                    except Exception as e:
-                        print(f"⚠️ AI outpainting failed for frame {i}: {e}")
-
-                # 8K Upscaling (optional) - ONLY ONCE
-                original_size = frame_data.shape[:2]
-                if upscale_to_8k:
-                    try:
-                        frame_data = smart_upscale_to_8k(frame_data, upscale_method)
-                        depth = smart_upscale_to_8k(depth, "nearest")
-                        print(f"📈 Upscaled from {original_size} to {frame_data.shape[:2]}")
-                    except Exception as e:
-                        print(f"⚠️ Upscaling failed for frame {i}: {e}")
-                        continue
-
-                # Create stereo pair
+                # --- STEP 2: Stereo pair creation ---
                 try:
                     left, right = make_stereo_pair_optimized(
                         frame_data, 
@@ -1398,44 +1571,59 @@ def process_frame_batch(
                         print(f"⚠️ Stereo creation returned None for frame {i}")
                         continue
 
-                    # DEBUG: Check resolutions
                     print(f"🔍 Frame {i}: Left={left.shape}, Right={right.shape}")
 
                 except Exception as e:
                     print(f"⚠️ Stereo creation failed for frame {i}: {e}")
                     continue
 
-                # Create side-by-side frame
-                try:
-                    # Ensure both eyes have same dimensions BEFORE concatenation
-                    if left.shape != right.shape:
-                        print(f"⚠️ Resizing right eye to match left: {right.shape} -> {left.shape}")
-                        right = cv2.resize(right, (left.shape[1], left.shape[0]))
-                    
-                    sbs_frame = np.concatenate((left, right), axis=1)
-                    
-                    # DEBUG: Check final SBS resolution
-                    print(f"🎯 SBS Frame {i}: {sbs_frame.shape}")
-                    
-                    # Verify this is 7680x3840 for 8K VR180
-                    if sbs_frame.shape[1] != 7680 or sbs_frame.shape[0] != 3840:
-                        print(f"❌ WRONG RESOLUTION: {sbs_frame.shape[1]}x{sbs_frame.shape[0]} (expected 7680x3840)")
-                        # Force correct resolution
-                        sbs_frame = cv2.resize(sbs_frame, (7680, 3840))
-                        print(f"✅ Corrected to: 7680x3840")
-                    
-                    # Save frame
-                    frame_path = os.path.join(temp_dir, f"{start_index + processed_count:06d}.png")
-                    success = cv2.imwrite(frame_path, sbs_frame, [cv2.IMWRITE_PNG_COMPRESSION, 6])
-                    
-                    if success:
-                        processed_count += 1
-                    else:
-                        print(f"⚠️ Failed to save frame {start_index + processed_count}")
-                        
-                except Exception as e:
-                    print(f"⚠️ Frame saving failed for frame {i}: {e}")
-                    continue
+                # --- STEP 3: Build SBS frame (before upscale) ---
+                if left.shape != right.shape:
+                    print(f"⚠️ Resizing right eye to match left: {right.shape} -> {left.shape}")
+                    right = cv2.resize(right, (left.shape[1], left.shape[0]))
+                
+                sbs_frame = np.concatenate((left, right), axis=1)
+                print(f"🎯 SBS Frame {i}: {sbs_frame.shape}")
+
+                # --- STEP 4: AI Outpainting (AFTER stereo, BEFORE upscale) ---
+                if outpainting_pipe is not None:
+                    try:
+                        sbs_rgb = cv2.cvtColor(sbs_frame, cv2.COLOR_BGR2RGB)
+                        pil_sbs = Image.fromarray(sbs_rgb)
+
+                        outpainted_sbs = ai_outpaint_frame_vr180(
+                            pil_sbs,
+                            expansion_percent=25,
+                            scene_context="hallway"  # adjust per scene
+                        )
+                        sbs_frame = cv2.cvtColor(np.array(outpainted_sbs), cv2.COLOR_RGB2BGR)
+                        print(f"✨ Outpainting applied for frame {i}")
+                    except Exception as e:
+                        print(f"⚠️ AI outpainting failed for frame {i}: {e}")
+
+                # --- STEP 5: Upscale to 8K (AFTER outpainting) ---
+                if upscale_to_8k:
+                    try:
+                        sbs_frame = smart_upscale_to_8k(sbs_frame, upscale_method)
+                        print(f"📈 Upscaled to: {sbs_frame.shape}")
+                    except Exception as e:
+                        print(f"⚠️ Upscaling failed for frame {i}: {e}")
+                        continue
+
+                # Ensure VR180 resolution (final check)
+                if sbs_frame.shape[1] != 7680 or sbs_frame.shape[0] != 3840:
+                    print(f"❌ WRONG RESOLUTION: {sbs_frame.shape[1]}x{sbs_frame.shape[0]} (expected 7680x3840)")
+                    sbs_frame = cv2.resize(sbs_frame, (7680, 3840))
+                    print(f"✅ Corrected to: 7680x3840")
+
+                # --- STEP 6: Save frame ---
+                frame_path = os.path.join(temp_dir, f"{start_index + processed_count:06d}.png")
+                success = cv2.imwrite(frame_path, sbs_frame, [cv2.IMWRITE_PNG_COMPRESSION, 6])
+                
+                if success:
+                    processed_count += 1
+                else:
+                    print(f"⚠️ Failed to save frame {start_index + processed_count}")
 
             except Exception as e:
                 print(f"❌ Frame {i} processing failed: {e}")
@@ -1446,7 +1634,6 @@ def process_frame_batch(
     except Exception as e:
         print(f"❌ Batch processing error: {e}")
         return 0
-
 
 def create_video_from_frames(frame_paths, output_path, fps):
     """
@@ -1559,7 +1746,7 @@ def inject_vr180_metadata_optimized(
     height: int = 3840
 ) -> None:
     """
-    Inject proper VR180 metadata for equirectangular side-by-side format
+    Inject proper VR180 metadata for CIRCULAR FISHEYE format
     """
     cmd = [
         "ffmpeg", "-y", 
@@ -1567,26 +1754,35 @@ def inject_vr180_metadata_optimized(
         "-c:v", "copy",
         "-c:a", "copy",
         "-movflags", "use_metadata_tags+faststart",
-        "-metadata:s:v:0", "spherical-video=true",
-        "-metadata:s:v:0", "stereoscopic-mode=left-right",  # Fixed: side-by-side
-        "-metadata:s:v:0", "projection-type=equirectangular",  # Fixed: standard VR180
-        "-metadata:s:v:0", f"full_pano_width_pixels={width}",
-        "-metadata:s:v:0", f"full_pano_height_pixels={height}",
-        "-metadata:s:v:0", f"cropped_area_image_width={width}",
-        "-metadata:s:v:0", f"cropped_area_image_height={height}",
-        "-metadata:s:v:0", "cropped_area_left=0",
-        "-metadata:s:v:0", "cropped_area_top=0",
+        "-metadata", "spherical=true",
+        "-metadata", "stereo-mode=left-right",
+        "-metadata", "projection-type=equidistant-fisheye",  # ← CHANGED TO FISHEYE
+        "-metadata", "com.google.vr.spherical=true",
+        "-metadata", "com.google.vr.stereo-mode=left-right",
+        "-metadata", "com.google.vr.projection-type=equidistant-fisheye",  # ← CHANGED
         output_video_path
     ]
     
     result = subprocess.run(cmd, capture_output=True, text=True)
     
     if result.returncode == 0:
-        print("✅ VR180 metadata injected successfully!")
+        print("✅ VR180 FISHEYE metadata injected successfully!")
     else:
         print(f"❌ Metadata injection failed: {result.stderr}")
-        raise RuntimeError("VR180 metadata injection failed")
-
+        # Fallback to simpler metadata
+        simple_cmd = [
+            "ffmpeg", "-y", 
+            "-i", input_video_path,
+            "-c", "copy",
+            "-metadata", "spherical=true",
+            "-metadata", "stereo-mode=left-right",
+            output_video_path
+        ]
+        result = subprocess.run(simple_cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            print("✅ Basic VR180 metadata injected!")
+        else:
+            raise RuntimeError("VR180 metadata injection failed")
 
 
 # Base directories
@@ -1718,7 +1914,7 @@ async def convert_video(
             convert_2d_to_vr180_gpu_optimized,
             input_path,
             output_path,
-            center_scale=0.82,
+            center_scale=0.8,
             focal_length=500,
             panini_alpha=0.7,
             stereographic_strength=0.2,
@@ -2137,3 +2333,6 @@ async def system_status():
         "disk_usage": psutil.disk_usage('/').percent,
         "batch_size": BATCH_SIZE
     }
+    
+    
+   
